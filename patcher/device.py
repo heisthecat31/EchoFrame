@@ -344,17 +344,25 @@ def shell(adb, serial, cmd, timeout=60):
 
 
 def push(adb, serial, local, remote, progress=None):
-    """adb push one file, reporting progress(bytes on the headset) about once a second."""
+    """adb push one file, reporting progress(bytes on the headset) about once a second. Gives
+    up if nothing arrives for two minutes."""
     p = subprocess.Popen([adb, "-s", serial, "push", local, remote], stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, creationflags=NO_WINDOW, encoding="utf-8", errors="replace")
+    import time
+    last, moved = -1, time.monotonic()
     while p.poll() is None:
         try:
             p.wait(1.5)
         except subprocess.TimeoutExpired:
-            if progress:
-                code, out = shell(adb, serial, f"stat -c %s '{remote}' 2>/dev/null", timeout=15)
-                if out.strip().isdigit():
-                    progress(int(out.strip()))
+            code, out = shell(adb, serial, f"stat -c %s '{remote}' 2>/dev/null", timeout=15)
+            size = int(out.strip()) if out.strip().isdigit() else -1
+            if size != last:
+                last, moved = size, time.monotonic()
+                if progress and size >= 0:
+                    progress(size)
+            elif time.monotonic() - moved > 120:
+                p.kill()
+                raise IOError(f"copying {os.path.basename(local)} to {remote} stalled (no progress for 2 minutes)")
     out = p.stdout.read().strip()
     if p.returncode != 0:
         raise IOError(f"copying {os.path.basename(local)} failed: {out.splitlines()[-1] if out else p.returncode}")
@@ -461,7 +469,7 @@ def install_game_data(adb, serial, log=print, progress=None):
         # Never copy over an existing install: Echo updates its data itself (a headset can
         # hold newer manifests and extra packages than the zip), so the zip could downgrade it
         say(0.96, "Game data is already on the headset. Checking the asset patches...")
-        install_asset_patches(store, cache, log)
+        install_asset_patches(store, cache, log, say)
         say(1.0, "Game data is already on the headset; asset patches up to date.")
         return
     store.check_writable()   # before 900 MB of downloading
@@ -510,15 +518,17 @@ def install_game_data(adb, serial, log=print, progress=None):
         raise IOError("the game data was copied, but the headset doesn't show all of it")
 
     say(0.96, "Applying asset patches...")
-    install_asset_patches(store, cache, log)
+    install_asset_patches(store, cache, log, say)
     store.done()
     os.remove(zpath)   # on the headset now: give the PC its 900 MB back
     say(1.0, "Game data installed.")
 
 
-def install_asset_patches(store, cache, log=print):
+def install_asset_patches(store, cache, log=print, say=None):
     """The Echo VR installer's mod patches: files listed in its update manifest, sha256-checked,
-    relative to Echo's storage folder."""
+    relative to Echo's storage folder. say(fraction, text) for each step."""
+    say = say or (lambda f, t: None)
+    say(0.96, "Asset patches: reading the list...")
     with urllib.request.urlopen(urllib.request.Request(PATCH_MANIFEST_URL, headers=UA), timeout=30) as r:
         text = r.read().decode("utf-8", "replace")
     base = re.search(r"^#\s*Base URL:\s*(\S+)", text, re.M)
@@ -526,27 +536,29 @@ def install_asset_patches(store, cache, log=print):
     if not base or not target or target.group(1).rstrip("/") != MEDIA:
         raise IOError("the asset patch list isn't in the expected format")
     base = base.group(1).rstrip("/")
-    for line in text.splitlines():
-        parts = line.split()
-        if len(parts) < 2 or line.startswith("#"):
-            continue
+    lines = [l.split() for l in text.splitlines() if len(l.split()) >= 2 and not l.startswith("#")]
+    for n, parts in enumerate(lines, 1):
         op, path = parts[0].lower(), parts[1]
+        step = f"Asset patch {n} of {len(lines)}"
         if not SAFE_PATH.match(path) or ".." in path:
             raise IOError(f"unexpected path in the asset patch list: {path}")
         if op == "del":
+            say(0.96, f"{step}: removing")
             store.remove(path)
         elif op == "add" and len(parts) >= 3:
             want = parts[2].lower()
+            say(0.96, f"{step}: checking")
             if store.sha256(path) == want:
                 continue
             local = os.path.join(cache, "patch-" + want)
-            fetch(f"{base}/{path}", local)
+            fetch(f"{base}/{path}", local, lambda d, t: say(0.96, f"{step}: downloading {d / 1e6:.1f} of {t / 1e6:.1f} MB"))
             with open(local, "rb") as f:
                 ok = hashlib.sha256(f.read()).hexdigest() == want
             try:
                 if not ok:
                     raise IOError(f"asset patch {path} didn't match its checksum")
-                store.put(local, path)
+                say(0.97, f"{step}: copying to the headset")
+                store.put(local, path, lambda b: say(0.97, f"{step}: copying to the headset ({b / 1e6:.1f} MB)"))
             finally:
                 os.remove(local)
             log(f"  patched {path}")
