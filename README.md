@@ -39,7 +39,11 @@ both are harmless on Quest). The result is
 signed with a **new random key every time** (saved next to it as `.signing-key.pem`; keep
 it private), so no two people share a signing key.
 
-Android only updates an app signed with the same key, so **uninstall Echo VR first**, then:
+Step 3 in the window does the rest over USB: **Install** (if Echo VR on the headset was
+signed with another key, it asks before uninstalling it; that removes Echo's app data on the
+headset), **Launch**, and **Save logs** (EchoQuestXR's and the OpenXR runtime's lines only:
+Echo's own log is left out because it prints the community-server password). No adb? The
+**Get adb** button downloads Google's platform-tools into the patcher folder. By hand:
 
 ```bash
 adb install <your-echo>_openxr.apk

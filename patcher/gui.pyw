@@ -2,8 +2,9 @@
 
     pythonw gui.pyw      (double-click on Windows)
 
-Same patches as patch.py; every run signs with a new random key. Drawn on one Canvas in
-EchoXR's installer style (palette and gradient from EchoXR's installer/ui.h).
+Same patches as patch.py; every run signs with a new random key. Step 3 installs the
+result on a connected headset, starts Echo and saves its logs (device.py). Drawn on one
+Canvas in EchoXR's installer style (palette and gradient from EchoXR's installer/ui.h).
 """
 import os
 import queue
@@ -11,15 +12,17 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
-from tkinter import filedialog
+import time
+from tkinter import filedialog, messagebox
 
+import device
 import patch
 
 # palette (EchoXR installer/ui.h)
 BG, CARD, CARD_HI, BORDER = "#0e1015", "#171a21", "#1d212a", "#262b36"
 TEXT, MUTED, FAINT = "#eef0f4", "#8e95a3", "#5a6170"
 ACCENT, ACCENT2, GOOD, WARN, BAD = "#5b8cff", "#9a6bff", "#3ddc97", "#ffb547", "#ff5d6c"
-W, H = 720, 560
+W, H = 720, 690
 
 if sys.platform == "win32":   # crisp on scaled displays
     try:
@@ -60,6 +63,12 @@ class App(tk.Tk):
         self.progress = 0.0
         self.lines = []
         self.msgs = queue.Queue()
+        # headset (step 3)
+        self.adb = None
+        self.devs = []                # [(serial, model, state)]
+        self.dev_busy = False
+        self.dev_msg, self.dev_tint = "", MUTED
+        threading.Thread(target=self.poll_devices, daemon=True).start()
         self.cv.bind("<Motion>", self.on_move)
         self.cv.bind("<Button-1>", self.on_click)
         self.after(50, self.tick)
@@ -160,7 +169,7 @@ class App(tk.Tk):
             cv.create_oval(self.px(52), self.px(y + 20), self.px(80), self.px(y + 48), fill=GOOD, outline=GOOD)
             self.text(66, y + 34, "✓", "h", BG, anchor="center")
             self.text(94, y + 18, "Patched and signed", "h", TEXT)
-            self.text(94, y + 46, "Uninstall Echo VR from the headset, then install the new APK:", "small", MUTED)
+            self.text(94, y + 46, "Install it on your headset below, or with adb yourself:", "small", MUTED)
             self.text(94, y + 68, f'adb install "{os.path.basename(out)}"', "mono", TEXT)
             self.text(94, y + 88, f"New signing key {fp[:16]}...  saved as {os.path.basename(key_path)} (keep it private)", "small", FAINT)
         elif self.state == "error":
@@ -171,13 +180,15 @@ class App(tk.Tk):
             self.text(32, y + 4, "Every patch is signed with a brand-new random key, so no two installs share one.", "small", MUTED)
             self.text(32, y + 24, "Android only updates an app signed with the same key: uninstall Echo VR before installing.", "small", MUTED)
 
+        self.draw_headset(452)
+
         # details (log)
         if self.lines:
-            self.text(32, 450, ("▾ Hide details" if self.details else "▸ Show details"),
+            self.text(32, 566, ("▾ Hide details" if self.details else "▸ Show details"),
                       "small", ACCENT if self.hot == "details" else MUTED, tags=("details",))
             if self.details:
-                self.rrect(32, 474, W - 64, 100, 10, CARD, outline=BORDER)
-                self.text(44, 482, "\n".join(self.lines[-5:]), "mono", MUTED, width=W - 88)
+                self.rrect(32, 590, W - 64, 100, 10, CARD, outline=BORDER)
+                self.text(44, 598, "\n".join(self.lines[-5:]), "mono", MUTED, width=W - 88)
 
         # footer
         busy = self.state == "working"
@@ -188,11 +199,92 @@ class App(tk.Tk):
             self.button(W - 32 - 200, hh - 70, 200, 48, "Patching..." if busy else "Patch and sign", "go",
                         primary=True, enabled=bool(self.apk and self.out) and self.verdict_ok is not None and not busy)
 
+    def installable(self):
+        if self.result:
+            return self.result[0]
+        return self.out if self.out and os.path.isfile(self.out) else None
+
+    def draw_headset(self, y):
+        self.rrect(32, y, W - 64, 100, 16, CARD, outline=BORDER)
+        self.text(52, y + 14, "3   HEADSET", "label", FAINT)
+        dev = self.devs[0] if self.devs else None
+        if not self.adb:
+            line, tint = "adb (Android platform-tools) isn't installed", WARN
+        elif not dev:
+            line, tint = "No headset: connect it by USB and allow USB debugging", MUTED
+        elif dev[2] != "device":
+            line, tint = f"{dev[1]}: {dev[2]} (accept the USB debugging prompt in the headset)", WARN
+        else:
+            line, tint = f"{dev[1]} connected", GOOD
+        self.cv.create_oval(self.px(53), self.px(y + 43), self.px(61), self.px(y + 51), fill=tint, outline=tint)
+        self.text(68, y + 38, line, "small", tint, width=W - 400)
+        if self.dev_msg:
+            self.text(52, y + 64, self.dev_msg, "small", self.dev_tint, width=W - 400)
+        ready = bool(dev and dev[2] == "device") and not self.dev_busy
+        if not self.adb:
+            self.button(W - 52 - 120, y + 30, 120, 38, "Get adb", "getadb", enabled=not self.dev_busy)
+        else:
+            self.button(W - 52 - 312, y + 30, 100, 38, "Install", "install", enabled=ready and bool(self.installable()))
+            self.button(W - 52 - 204, y + 30, 92, 38, "Launch", "launch", enabled=ready)
+            self.button(W - 52 - 104, y + 30, 104, 38, "Save logs", "logs", enabled=ready)
+
+    # ------------------------------------------------------------------ headset
+    def poll_devices(self):
+        while True:
+            try:
+                adb = device.find_adb()
+                devs = device.devices(adb) if adb else []
+                self.msgs.put(("devices", (adb, devs)))
+            except Exception:
+                pass
+            time.sleep(2)
+
+    def dev_job(self, fn, *args):
+        self.dev_busy = True
+        self.job_id = getattr(self, "job_id", 0) + 1
+        me = self.job_id
+        def run():
+            try:
+                fn(*args)
+            except Exception as e:   # adb missing, device gone, network: say so
+                self.msgs.put(("devmsg", (f"{type(e).__name__}: {e}", BAD)))
+            self.msgs.put(("devdone", me))   # only the latest job clears "busy"
+        threading.Thread(target=run, daemon=True).start()
+
+    def job_getadb(self):
+        self.msgs.put(("devmsg", ("Downloading Android platform-tools from Google...", MUTED)))
+        device.download_adb(log=lambda m: None)
+        self.msgs.put(("devmsg", ("adb ready.", GOOD)))
+
+    def job_install(self, serial, apk, allow_uninstall=False):
+        self.msgs.put(("devmsg", (f"Installing {os.path.basename(apk)}... (about a minute)", MUTED)))
+        if allow_uninstall:
+            ok, out = device.uninstall(self.adb, serial)
+            if not ok:
+                self.msgs.put(("devmsg", (f"Couldn't uninstall the old Echo VR: {out}", BAD)))
+                return
+        kind, text = device.install(self.adb, serial, apk)
+        if kind == "ok":
+            self.msgs.put(("devmsg", ("Installed. Press Launch, then put the headset on.", GOOD)))
+        elif kind == "signature":
+            self.msgs.put(("ask_uninstall", (serial, apk)))
+        else:
+            self.msgs.put(("devmsg", (f"Install failed: {text}", BAD)))
+
+    def job_launch(self, serial):
+        ok, out = device.launch(self.adb, serial)
+        self.msgs.put(("devmsg", ("Echo VR started: put the headset on." if ok else f"Couldn't start Echo: {out}",
+                                  GOOD if ok else BAD)))
+
+    def job_logs(self, serial, path):
+        n = device.save_logs(self.adb, serial, path)
+        self.msgs.put(("devmsg", (f"Saved {n} log lines to {os.path.basename(path)}", GOOD)))
+
     # ------------------------------------------------------------------ events
     def item_tag(self, e):
         for item in reversed(self.cv.find_overlapping(e.x, e.y, e.x, e.y)):
             for t in self.cv.gettags(item):
-                if t in ("pick", "out", "go", "folder", "again", "details"):
+                if t in ("pick", "out", "go", "folder", "again", "details", "getadb", "install", "launch", "logs"):
                     return t
         return None
 
@@ -223,7 +315,30 @@ class App(tk.Tk):
             self.state, self.lines, self.details = "pick", [], False
         elif t == "details":
             self.details = not self.details
+        elif t in ("getadb", "install", "launch", "logs") and not self.dev_busy:
+            self.headset_click(t)
         self.draw()
+
+    def headset_click(self, t):
+        if t == "getadb":
+            if messagebox.askyesno("EchoQuestXR", "Download Android platform-tools (adb, about 7 MB) from Google "
+                                   "(dl.google.com) into the patcher folder?"):
+                self.dev_job(self.job_getadb)
+            return
+        serial = self.devs[0][0] if self.devs else None
+        if not serial:
+            return
+        if t == "install" and self.installable():
+            self.dev_job(self.job_install, serial, self.installable())
+        elif t == "launch":
+            self.dev_job(self.job_launch, serial)
+        elif t == "logs":
+            base = os.path.dirname(self.out) if self.out else os.path.expanduser("~")
+            path = filedialog.asksaveasfilename(title="Save the EchoQuestXR log as", defaultextension=".txt",
+                                                initialdir=base, initialfile=time.strftime("echoquestxr-log-%Y%m%d-%H%M%S.txt"),
+                                                filetypes=[("Text", "*.txt")])
+            if path:
+                self.dev_job(self.job_logs, serial, path)
 
     def pick_apk(self):
         path = filedialog.askopenfilename(title="Choose your Echo VR Quest APK",
@@ -277,6 +392,24 @@ class App(tk.Tk):
                 self.state, self.result = "done", v
             elif kind == "error":
                 self.state, self.message = "error", v
+            elif kind == "devices":
+                if v != (self.adb, self.devs):
+                    self.adb, self.devs = v
+            elif kind == "devmsg":
+                self.dev_msg, self.dev_tint = v
+            elif kind == "devdone":
+                if v == self.job_id:
+                    self.dev_busy = False
+            elif kind == "ask_uninstall":
+                serial, apk = v
+                if messagebox.askyesno("EchoQuestXR", "Echo VR on the headset is signed with a different key, so it "
+                                       "has to be uninstalled first.\n\nUninstalling removes Echo VR's app data on the "
+                                       "headset (settings and login). The game files in Android/media normally stay, "
+                                       "but back them up first if you're unsure.\n\nUninstall Echo VR and install the "
+                                       "patched one?", icon="warning"):
+                    self.dev_job(self.job_install, serial, apk, True)
+                else:
+                    self.dev_msg, self.dev_tint = "Not installed: the old Echo VR is still there.", WARN
         if changed:
             self.draw()
         self.after(50, self.tick)

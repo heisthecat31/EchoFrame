@@ -13,3 +13,5 @@ __pycache__/
 # logs of any kind (they can hold account details)
 *.log
 *.dmp
+# adb the patcher downloads (Google platform-tools)
+patcher/platform-tools/
