@@ -134,7 +134,8 @@ PROBE = "; ".join([
 # Steam Frame: adb lands on SteamOS, and Lepton keeps each Android app's storage under
 # ~/Applications/Android/<package>. Where Echo's storage and Android's log are. Read-only;
 # journal lines are limited to EchoQuestXR/OpenXR/Lepton and never Echo's RAD log.
-LEPTON = f"$HOME/Applications/Android"
+LEPTON = "$HOME/Applications/Android"
+LEPTON_CONTAINER = f"lepton-steamlaunch-$(cat {LEPTON}/{PACKAGE}/instance.id)"   # launch.sh's name
 PROBE_STEAMOS = "; ".join([
     "echo '## lepton apps'", f"ls -la {LEPTON} 2>&1 | head -20",
     "echo '## echo storage'", f"find {LEPTON}/{PACKAGE} -maxdepth 6 2>&1 | head -80",
@@ -155,6 +156,21 @@ PROBE_STEAMOS = "; ".join([
     f"2>/dev/null | grep -vx \"{LEPTON}/{PACKAGE}\" | head -20",
     "echo '## disk images'", "find $HOME /var -maxdepth 10 \\( -name '*.img' -o -name '*.qcow2' -o -name '*.erofs' "
     "-o -name '*.sfs' \\) -size +50M 2>/dev/null | head -20",
+    # launch.sh: Echo runs in podman container lepton-steamlaunch-<instance.id>, its data in
+    # compatdata/<id>/internal, and only ~/.local/share/Steam is mounted in the container
+    f"ID=$(cat {LEPTON}/{PACKAGE}/instance.id 2>/dev/null); C=lepton-steamlaunch-$ID; "
+    "S=$HOME/.local/share/Steam; echo instance=$ID container=$C",
+    "echo '## steam dir'", "readlink -f $S; ls -la $HOME/.local/share/ 2>&1 | grep -i steam",
+    "echo '## lepton (followed)'", "ls -la $S/steamapps/common/Lepton/ 2>&1 | head -30",
+    "echo '## compatdata'", "find -L $S/steamapps/compatdata/$ID -maxdepth 8 -type d 2>/dev/null | head -100",
+    "echo '## echo data (followed)'", "find -L $S -maxdepth 14 \\( -name com.readyatdawn.r15 -o -name _data \\) "
+    "-type d 2>/dev/null | head -20",
+    "echo '## container'", "podman ps -a --format '{{.Names}} {{.Status}}' 2>&1 | head",
+    "podman inspect --format '{{.State.Running}} {{range .Mounts}}{{.Source}} -> {{.Destination}}; {{end}}' $C 2>&1 "
+    "| head -c 3000",
+    "echo; echo '## inside the container'", "podman exec $C sh -c 'id; ls -ld /sdcard /storage/emulated/0 "
+    f"/sdcard/Android/media {MEDIA}; ls -la {MEDIA}; touch {MEDIA}/.eqx && rm {MEDIA}/.eqx && echo media-writable; "
+    "mount | grep -iE \"sdcard|storage|media|/data|Steam\" | head -30' 2>&1 | head -60",
     "echo '## journal'", "journalctl --user -n 3000 --no-pager 2>/dev/null | grep -E "
     "'EchoQuestXR|OpenXR|openxr|[Ll]epton|AndroidRuntime|readyatdawn' | grep -v RAD | tail -60",
 ])
@@ -209,6 +225,12 @@ def save_logs(adb, serial, path):
     If the headset's shell can't run logcat at all, writes what that shell is instead, so the
     log says why. Returns the number of lines."""
     code, out = tool(adb, serial, "logcat", "-d", "-v", "time", *LOG_TAGS, timeout=60)
+    if not_found(out):   # Steam Frame: adb is on SteamOS; Android runs in Echo's Lepton container
+        tags = " ".join(f"'{t}'" for t in LOG_TAGS)
+        code, got = run(adb, "-s", serial, "shell", f"podman exec {LEPTON_CONTAINER} logcat -d -v time {tags} 2>&1",
+                        timeout=60)
+        if code == 0 and got.strip() and not not_found(got) and "Error:" not in got:
+            out = "(logcat from Echo's Lepton container)\n" + got
     if not_found(out):
         first = out.strip().splitlines()[-1] if out.strip() else "no output"
         code, diag = run(adb, "-s", serial, "shell", PROBE, timeout=90)
