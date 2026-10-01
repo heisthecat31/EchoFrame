@@ -39,11 +39,22 @@ both are harmless on Quest). The result is
 signed with a **new random key every time** (saved next to it as `.signing-key.pem`; keep
 it private), so no two people share a signing key.
 
-Step 3 in the window does the rest over USB: **Install** (if Echo VR on the headset was
-signed with another key, it asks before uninstalling it; that removes Echo's app data on the
-headset), **Launch**, and **Save logs** (EchoQuestXR's and the OpenXR runtime's lines only:
-Echo's own log is left out because it prints the community-server password). No adb? The
-**Get adb** button downloads Google's platform-tools into the patcher folder. By hand:
+Step 3 in the window does the rest, over USB or (Steam Frame) **Connect...** with the adb
+address Frame Control shows:
+- **Install**: the patched APK (if Echo VR on the headset was signed with another key, it asks
+  before uninstalling it; that removes Echo's app data on the headset), then, ticked by
+  default, **Echo's game data**: `_data.zip` from the same mirrors as the
+  [Echo VR installer app](https://github.com/heisthecat31/EchoVR-Installer) (about 900 MB,
+  downloaded once, resumable), copied to `/sdcard/Android/media/com.readyatdawn.r15/files/`
+  where Echo reads it, plus the installer's asset patches (sha256-checked). A headset that
+  already has game data is left as it is (Echo updates it itself; the zip could be older),
+  and `config.json` (the community-server login) is never touched.
+- **Launch**, and **Save logs** (EchoQuestXR's and the OpenXR runtime's lines only: Echo's own
+  log is left out because it prints the community-server password). If the headset's shell
+  can't run `logcat`, the saved file says what that shell is instead.
+
+adb (Google's platform-tools) installs itself when the window opens, into
+`%LOCALAPPDATA%\EchoQuestXR` for the `.exe`. By hand:
 
 ```bash
 adb install <your-echo>_openxr.apk
@@ -118,8 +129,9 @@ Ready on the EchoQuestXR side, untested on a Frame:
   d-pad down/up as X/Y, View as menu), Valve Index and the generic simple controller, as
   well as Touch.
 
-To try it: sideload the patched APK through Lepton (Frame Control does this), then read
-`adb logcat -s EchoQuestXR` from the Frame. The first lines list the OpenXR extensions,
+To try it: sideload the patched APK through Lepton (Frame Control does this, or the
+patcher's Install over Connect...), get the game data onto it (Install, above), then read
+`adb logcat -s EchoQuestXR` from the Frame (Save logs). The first lines list the OpenXR extensions,
 the Vulkan extensions left out, and any swapchain-format problem.
 
 ## Not done yet

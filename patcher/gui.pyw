@@ -22,7 +22,7 @@ import patch
 BG, CARD, CARD_HI, BORDER = "#0e1015", "#171a21", "#1d212a", "#262b36"
 TEXT, MUTED, FAINT = "#eef0f4", "#8e95a3", "#5a6170"
 ACCENT, ACCENT2, GOOD, WARN, BAD = "#5b8cff", "#9a6bff", "#3ddc97", "#ffb547", "#ff5d6c"
-W, H = 720, 690
+W, H = 720, 730
 
 
 def _version():
@@ -88,7 +88,11 @@ class App(tk.Tk):
         self.devs = []                # [(serial, model, state)]
         self.dev_busy = False
         self.dev_msg, self.dev_tint = "", MUTED
+        self.dev_progress = None      # 0..1 while game data is copied
+        self.with_data = True         # Install also copies Echo's game data
         threading.Thread(target=self.poll_devices, daemon=True).start()
+        if not device.find_adb():   # every headset action needs adb: install it right away
+            self.dev_job(self.job_getadb)
         self.cv.bind("<Motion>", self.on_move)
         self.cv.bind("<Button-1>", self.on_click)
         self.after(50, self.tick)
@@ -204,11 +208,11 @@ class App(tk.Tk):
 
         # details (log)
         if self.lines:
-            self.text(32, 566, ("▾ Hide details" if self.details else "▸ Show details"),
+            self.text(32, 602, ("▾ Hide details" if self.details else "▸ Show details"),
                       "small", ACCENT if self.hot == "details" else MUTED, tags=("details",))
             if self.details:
-                self.rrect(32, 590, W - 64, 100, 10, CARD, outline=BORDER)
-                self.text(44, 598, "\n".join(self.lines[-5:]), "mono", MUTED, width=W - 88)
+                self.rrect(32, 626, W - 64, 100, 10, CARD, outline=BORDER)
+                self.text(44, 634, "\n".join(self.lines[-5:]), "mono", MUTED, width=W - 88)
 
         # footer
         busy = self.state == "working"
@@ -225,11 +229,11 @@ class App(tk.Tk):
         return self.out if self.out and os.path.isfile(self.out) else None
 
     def draw_headset(self, y):
-        self.rrect(32, y, W - 64, 100, 16, CARD, outline=BORDER)
+        self.rrect(32, y, W - 64, 136, 16, CARD, outline=BORDER)
         self.text(52, y + 14, "3   HEADSET", "label", FAINT)
         dev = self.devs[0] if self.devs else None
         if not self.adb:
-            line, tint = "Quest: plug in by USB and allow USB debugging. Steam Frame: Connect... (adb installs itself)", MUTED
+            line, tint = "Getting adb (Android platform-tools) ready...", MUTED
         elif not dev:
             line, tint = "No headset. Quest: plug in by USB and allow USB debugging. Steam Frame: Connect...", MUTED
         elif dev[2] != "device":
@@ -237,17 +241,25 @@ class App(tk.Tk):
         else:
             line, tint = f"{dev[1]} connected", GOOD
         self.cv.create_oval(self.px(53), self.px(y + 43), self.px(61), self.px(y + 51), fill=tint, outline=tint)
-        self.text(68, y + 38, line, "small", tint, width=W - 400)
+        buttons_left = W - 52 - (312 if dev else 140)
+        self.text(68, y + 38, line, "small", tint, width=buttons_left - 84)
         if self.dev_msg:
-            self.text(52, y + 64, self.dev_msg, "small", self.dev_tint, width=W - 400)
+            self.text(52, y + 72, self.dev_msg, "small", self.dev_tint, width=W - 104)
+        if self.dev_progress is not None:
+            self.rrect(52, y + 96, W - 104, 6, 3, "#262b36")
+            self.pill_gradient(52, y + 96, max(10, (W - 104) * self.dev_progress), 6, ACCENT, ACCENT2)
+        box = "☑" if self.with_data else "☐"
+        self.text(52, y + 110, f"{box}  Install also copies Echo's game data (about 900 MB, downloaded once; "
+                  "skipped if the headset already has it)", "small",
+                  ACCENT if self.hot == "data" else (TEXT if self.with_data else MUTED), tags=("data",))
         ready = bool(dev and dev[2] == "device") and not self.dev_busy
-        if not self.adb:   # the buttons install adb first (needs it to see any headset)
-            self.button(W - 52 - 252, y + 30, 140, 38, "Connect...", "connect", enabled=not self.dev_busy)
-            self.button(W - 52 - 104, y + 30, 104, 38, "Find USB", "getadb", enabled=not self.dev_busy)
+        if not self.adb:   # installing itself (or failed: retry)
+            self.button(W - 52 - 120, y + 30, 120, 38, "Get adb", "getadb", enabled=not self.dev_busy)
         elif not dev:   # nothing over USB: offer adb over the network (Steam Frame)
             self.button(W - 52 - 140, y + 30, 140, 38, "Connect...", "connect", enabled=not self.dev_busy)
         else:
-            self.button(W - 52 - 312, y + 30, 100, 38, "Install", "install", enabled=ready and bool(self.installable()))
+            self.button(W - 52 - 312, y + 30, 100, 38, "Install", "install",
+                        enabled=ready and bool(self.installable() or self.with_data))
             self.button(W - 52 - 204, y + 30, 92, 38, "Launch", "launch", enabled=ready)
             self.button(W - 52 - 104, y + 30, 104, 38, "Save logs", "logs", enabled=ready)
 
@@ -274,34 +286,49 @@ class App(tk.Tk):
             self.msgs.put(("devdone", me))   # only the latest job clears "busy"
         threading.Thread(target=run, daemon=True).start()
 
-    def job_getadb(self, then=None):
+    def job_getadb(self):
         self.msgs.put(("devmsg", ("Installing adb (Android platform-tools from Google)...", MUTED)))
-        adb = device.download_adb(log=lambda m: None)
+        try:
+            adb = device.download_adb(log=lambda m: None)
+        except Exception as e:
+            raise RuntimeError(f"couldn't install adb ({e}). Check the internet connection, then Get adb.")
         self.msgs.put(("adb", adb))
         self.msgs.put(("devmsg", ("adb installed.", GOOD)))
-        if then:
-            self.msgs.put(("then", then))   # carry on with what was clicked
 
     def job_connect(self, target):
         self.msgs.put(("devmsg", (f"Connecting to {target}...", MUTED)))
         ok, out = device.connect(self.adb, target)
-        self.msgs.put(("devmsg", ("Connected. Launch Echo on the Frame, then Save logs." if ok else f"Couldn't connect: {out}",
+        self.msgs.put(("devmsg", ("Connected. Install sends Echo and its game data; Launch starts it." if ok else f"Couldn't connect: {out}",
                                   GOOD if ok else BAD)))
 
-    def job_install(self, serial, apk, allow_uninstall=False):
-        self.msgs.put(("devmsg", (f"Installing {os.path.basename(apk)}... (about a minute)", MUTED)))
-        if allow_uninstall:
-            ok, out = device.uninstall(self.adb, serial)
-            if not ok:
-                self.msgs.put(("devmsg", (f"Couldn't uninstall the old Echo VR: {out}", BAD)))
+    def job_install(self, serial, apk, with_data, allow_uninstall=False):
+        if apk:
+            self.msgs.put(("devmsg", (f"Installing {os.path.basename(apk)}... (about a minute)", MUTED)))
+            if allow_uninstall:
+                ok, out = device.uninstall(self.adb, serial)
+                if not ok:
+                    self.msgs.put(("devmsg", (f"Couldn't uninstall the old Echo VR: {out}", BAD)))
+                    return
+            kind, text = device.install(self.adb, serial, apk)
+            if kind == "signature":
+                self.msgs.put(("ask_uninstall", (serial, apk, with_data)))
                 return
-        kind, text = device.install(self.adb, serial, apk)
-        if kind == "ok":
-            self.msgs.put(("devmsg", ("Installed. Press Launch, then put the headset on.", GOOD)))
-        elif kind == "signature":
-            self.msgs.put(("ask_uninstall", (serial, apk)))
-        else:
-            self.msgs.put(("devmsg", (f"Install failed: {text}", BAD)))
+            if kind != "ok":
+                self.msgs.put(("devmsg", (f"Install failed: {text}", BAD)))
+                return
+        if with_data:
+            self.job_data(serial)
+        self.msgs.put(("devmsg", ("Installed. Press Launch, then put the headset on." if apk else
+                                  "Game data ready. Press Launch, then put the headset on.", GOOD)))
+
+    def job_data(self, serial):
+        def progress(f, text):
+            self.msgs.put(("devprogress", f))
+            self.msgs.put(("devmsg", (text, MUTED)))
+        try:
+            device.install_game_data(self.adb, serial, log=lambda m: self.msgs.put(("log", m)), progress=progress)
+        finally:
+            self.msgs.put(("devprogress", None))
 
     def job_launch(self, serial):
         ok, out = device.launch(self.adb, serial)
@@ -316,7 +343,8 @@ class App(tk.Tk):
     def item_tag(self, e):
         for item in reversed(self.cv.find_overlapping(e.x, e.y, e.x, e.y)):
             for t in self.cv.gettags(item):
-                if t in ("pick", "out", "go", "folder", "again", "details", "getadb", "connect", "install", "launch", "logs"):
+                if t in ("pick", "out", "go", "folder", "again", "details", "data", "getadb", "connect", "install",
+                         "launch", "logs"):
                     return t
         return None
 
@@ -347,18 +375,15 @@ class App(tk.Tk):
             self.state, self.lines, self.details = "pick", [], False
         elif t == "details":
             self.details = not self.details
+        elif t == "data" and not self.dev_busy:
+            self.with_data = not self.with_data
         elif t in ("getadb", "connect", "install", "launch", "logs") and not self.dev_busy:
             self.headset_click(t)
         self.draw()
 
     def headset_click(self, t):
-        if not self.adb:   # every headset action needs adb: install it first, once
-            if messagebox.askyesno("EchoQuestXR", "This needs adb (Android platform-tools, about 7 MB), which "
-                                   "isn't installed. Download it from Google (dl.google.com) into "
-                                   f"{device.DATA} now?"):
-                self.dev_job(self.job_getadb, None if t == "getadb" else t)
-            return
-        if t == "getadb":
+        if not self.adb:   # every headset action needs adb (it installs itself at startup)
+            self.dev_job(self.job_getadb)
             return
         if t == "connect":
             target = simpledialog.askstring(
@@ -371,8 +396,8 @@ class App(tk.Tk):
         serial = self.devs[0][0] if self.devs else None
         if not serial:
             return
-        if t == "install" and self.installable():
-            self.dev_job(self.job_install, serial, self.installable())
+        if t == "install" and (self.installable() or self.with_data):
+            self.dev_job(self.job_install, serial, self.installable(), self.with_data)
         elif t == "launch":
             self.dev_job(self.job_launch, serial)
         elif t == "logs":
@@ -436,25 +461,27 @@ class App(tk.Tk):
             elif kind == "error":
                 self.state, self.message = "error", v
             elif kind == "devices":
-                if v != (self.adb, self.devs):
-                    self.adb, self.devs = v
+                adb, devs = v
+                if adb is None and self.adb and os.path.isfile(self.adb):
+                    adb = self.adb   # a scan from before adb was installed: keep the new adb
+                self.adb, self.devs = adb, devs
+            elif kind == "devprogress":
+                self.dev_progress = v
             elif kind == "devmsg":
                 self.dev_msg, self.dev_tint = v
             elif kind == "adb":
                 self.adb = v
-            elif kind == "then":
-                self.after(10, lambda t=v: self.headset_click(t))
             elif kind == "devdone":
                 if v == self.job_id:
                     self.dev_busy = False
             elif kind == "ask_uninstall":
-                serial, apk = v
+                serial, apk, with_data = v
                 if messagebox.askyesno("EchoQuestXR", "Echo VR on the headset is signed with a different key, so it "
                                        "has to be uninstalled first.\n\nUninstalling removes Echo VR's app data on the "
                                        "headset (settings and login). The game files in Android/media normally stay, "
                                        "but back them up first if you're unsure.\n\nUninstall Echo VR and install the "
                                        "patched one?", icon="warning"):
-                    self.dev_job(self.job_install, serial, apk, True)
+                    self.dev_job(self.job_install, serial, apk, with_data, True)
                 else:
                     self.dev_msg, self.dev_tint = "Not installed: the old Echo VR is still there.", WARN
         if changed:

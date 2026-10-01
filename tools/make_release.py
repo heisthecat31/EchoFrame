@@ -36,16 +36,21 @@ untested so far, on Steam Frame and other OpenXR headsets.
      debugging first. Android only updates an app signed with the same key, so the
      window asks before uninstalling an Echo VR signed with another key (that removes
      Echo's app data on the headset; the game files normally stay).
-   - Steam Frame: install the patched APK with Frame Control
-     (https://github.com/saphid/frame-control): enable Developer Mode on the Frame,
-     let Frame Control connect, then install the APK file. Echo appears in your
-     Steam library.
+   - Steam Frame: enable Developer Mode on the Frame and let Frame Control
+     (https://github.com/saphid/frame-control) connect. Then in the window press
+     Connect... and enter the adb address Frame Control shows (IP:port), and Install.
+     (Or install the APK file with Frame Control itself, then Install here for the
+     game data.) Echo appears in your Steam library.
+
+Game data: with "Install also copies Echo's game data" ticked (the default), Install
+also downloads Echo's game data (about 900 MB, once; from the same mirrors as the
+Echo VR installer app) and copies it to Android/media/com.readyatdawn.r15/files on
+the headset, where Echo reads it, plus the installer's asset patches. A headset that
+already has game data is left as it is. Your config.json (login) is never touched.
 
 Logs: "Save logs" in the window (EchoQuestXR and OpenXR lines only; Echo's own log
-is left out because it prints the community-server password). The headset buttons
-install adb (Google's platform-tools) by themselves the first time, after asking.
-Steam Frame: launch Echo on the Frame, press Connect... and enter the adb address
-Frame Control shows for Echo (IP:port), then Save logs.
+is left out because it prints the community-server password). adb (Google's
+platform-tools) installs itself when the window opens.
 
 The patch changes three things in the APK: lib/arm64-v8a/libvrapi.so (VrApi on
 OpenXR), lib/arm64-v8a/libopenxr_loader.so (Khronos OpenXR loader) and the manifest
