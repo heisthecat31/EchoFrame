@@ -22,7 +22,7 @@ import patch
 BG, CARD, CARD_HI, BORDER = "#0e1015", "#171a21", "#1d212a", "#262b36"
 TEXT, MUTED, FAINT = "#eef0f4", "#8e95a3", "#5a6170"
 ACCENT, ACCENT2, GOOD, WARN, BAD = "#5b8cff", "#9a6bff", "#3ddc97", "#ffb547", "#ff5d6c"
-W, H = 720, 730
+W, H = 720, 756
 
 
 def _version():
@@ -90,6 +90,9 @@ class App(tk.Tk):
         self.dev_msg, self.dev_tint = "", MUTED
         self.dev_progress = None      # 0..1 while game data is copied
         self.with_data = True         # Install also copies Echo's game data
+        self.for_frame = False        # Steam Frame build: game data in Echo's private folder
+        self.built_for_frame = False
+        self.dev_frame = False        # the connected headset is a Steam Frame
         threading.Thread(target=self.poll_devices, daemon=True).start()
         if not device.find_adb():   # every headset action needs adb: install it right away
             self.dev_job(self.job_getadb)
@@ -175,13 +178,17 @@ class App(tk.Tk):
 
         # step 2: where it goes
         y = 240
-        self.rrect(32, y, W - 64, 70, 16, CARD, outline=BORDER)
+        self.rrect(32, y, W - 64, 96, 16, CARD, outline=BORDER)
         self.text(52, y + 14, "2   SAVE AS", "label", FAINT)
         self.text(52, y + 36, self.out or "Chosen after you pick the APK", "small", TEXT if self.out else FAINT, width=W - 200)
         self.button(W - 140, y + 18, 88, 34, "Change", "out", enabled=bool(self.apk) and self.state != "working")
+        box = "☑" if self.for_frame else "☐"
+        self.text(52, y + 66, f"{box}  For Steam Frame: Echo reads its game data from its private folder "
+                  f"({patch.FRAME_DATA_DIR})", "small",
+                  ACCENT if self.hot == "frame" else (TEXT if self.for_frame else MUTED), tags=("frame",))
 
         # status / result area
-        y = 326
+        y = 352
         if self.state == "working":
             self.rrect(32, y, W - 64, 8, 4, "#262b36")
             fill = max(16, (W - 64) * self.progress)
@@ -192,7 +199,7 @@ class App(tk.Tk):
             self.rrect(32, y, W - 64, 112, 16, mix(GOOD, BG, .88), outline=mix(GOOD, BG, .6))
             cv.create_oval(self.px(52), self.px(y + 20), self.px(80), self.px(y + 48), fill=GOOD, outline=GOOD)
             self.text(66, y + 34, "✓", "h", BG, anchor="center")
-            self.text(94, y + 18, "Patched and signed", "h", TEXT)
+            self.text(94, y + 18, "Patched and signed" + (" for Steam Frame" if self.built_for_frame else ""), "h", TEXT)
             self.text(94, y + 46, "Install it on your headset below, or with adb yourself:", "small", MUTED)
             self.text(94, y + 68, f'adb install "{os.path.basename(out)}"', "mono", TEXT)
             self.text(94, y + 88, f"New signing key {fp[:16]}...  saved as {os.path.basename(key_path)} (keep it private)", "small", FAINT)
@@ -204,15 +211,15 @@ class App(tk.Tk):
             self.text(32, y + 4, "Every patch is signed with a brand-new random key, so no two installs share one.", "small", MUTED)
             self.text(32, y + 24, "Android only updates an app signed with the same key: uninstall Echo VR before installing.", "small", MUTED)
 
-        self.draw_headset(452)
+        self.draw_headset(478)
 
         # details (log)
         if self.lines:
-            self.text(32, 602, ("▾ Hide details" if self.details else "▸ Show details"),
+            self.text(32, 628, ("▾ Hide details" if self.details else "▸ Show details"),
                       "small", ACCENT if self.hot == "details" else MUTED, tags=("details",))
             if self.details:
-                self.rrect(32, 626, W - 64, 100, 10, CARD, outline=BORDER)
-                self.text(44, 634, "\n".join(self.lines[-5:]), "mono", MUTED, width=W - 88)
+                self.rrect(32, 652, W - 64, 100, 10, CARD, outline=BORDER)
+                self.text(44, 660, "\n".join(self.lines[-5:]), "mono", MUTED, width=W - 88)
 
         # footer
         busy = self.state == "working"
@@ -298,6 +305,10 @@ class App(tk.Tk):
     def job_connect(self, target):
         self.msgs.put(("devmsg", (f"Connecting to {target}...", MUTED)))
         ok, out = device.connect(self.adb, target)
+        if ok:
+            serial = target.strip() if ":" in target else target.strip() + ":5555"
+            if device.frame_info(self.adb, serial):
+                self.msgs.put(("frame", True))
         self.msgs.put(("devmsg", ("Connected. Install sends Echo and its game data; Launch starts it." if ok else f"Couldn't connect: {out}",
                                   GOOD if ok else BAD)))
 
@@ -343,7 +354,7 @@ class App(tk.Tk):
     def item_tag(self, e):
         for item in reversed(self.cv.find_overlapping(e.x, e.y, e.x, e.y)):
             for t in self.cv.gettags(item):
-                if t in ("pick", "out", "go", "folder", "again", "details", "data", "getadb", "connect", "install",
+                if t in ("pick", "out", "go", "folder", "again", "details", "data", "frame", "getadb", "connect", "install",
                          "launch", "logs"):
                     return t
         return None
@@ -377,9 +388,19 @@ class App(tk.Tk):
             self.details = not self.details
         elif t == "data" and not self.dev_busy:
             self.with_data = not self.with_data
+        elif t == "frame" and self.state != "working":
+            self.set_frame(not self.for_frame)
         elif t in ("getadb", "connect", "install", "launch", "logs") and not self.dev_busy:
             self.headset_click(t)
         self.draw()
+
+    def set_frame(self, on):
+        """Ticks or unticks the Steam Frame build, renaming the output to match."""
+        self.for_frame = on
+        if self.out and self.state != "done":
+            stem, ext = os.path.splitext(self.out)
+            stem = stem[:-len("_frame")] if stem.endswith("_openxr_frame") else stem
+            self.out = stem + ("_frame" if on and stem.endswith("_openxr") else "") + ext
 
     def headset_click(self, t):
         if not self.adb:   # every headset action needs adb (it installs itself at startup)
@@ -397,6 +418,11 @@ class App(tk.Tk):
         if not serial:
             return
         if t == "install" and (self.installable() or self.with_data):
+            if self.dev_frame and self.installable() and not self.built_for_frame and not messagebox.askyesno(
+                    "EchoQuestXR", "This is a Steam Frame, but the APK wasn't patched with \"For Steam Frame\" "
+                    "ticked, so Echo will look for its game data where the Frame can't keep it.\n\n"
+                    "Tick it, Patch and sign again, then Install. Install this one anyway?", icon="warning"):
+                return
             self.dev_job(self.job_install, serial, self.installable(), self.with_data)
         elif t == "launch":
             self.dev_job(self.job_launch, serial)
@@ -414,7 +440,7 @@ class App(tk.Tk):
         if not path:
             return
         self.apk = path
-        self.out = os.path.splitext(path)[0] + "_openxr.apk"
+        self.out = os.path.splitext(path)[0] + ("_openxr_frame.apk" if self.for_frame else "_openxr.apk")
         self.state, self.lines, self.result = "ready", [], None
         try:
             self.verdict = patch.inspect(path)
@@ -427,9 +453,9 @@ class App(tk.Tk):
     def start(self):
         self.state, self.message, self.progress, self.lines = "working", "Reading the APK...", 0.05, []
         self.draw()
-        threading.Thread(target=self.work, args=(self.apk, self.out), daemon=True).start()
+        threading.Thread(target=self.work, args=(self.apk, self.out, self.for_frame), daemon=True).start()
 
-    def work(self, apk, out):
+    def work(self, apk, out, for_frame=False):
         steps = {"Runtime": .2, "  added": .4, "  replaced": .5, "Generating": .6, "Wrote": .95}
         def log(m):
             for k, v in steps.items():
@@ -439,7 +465,9 @@ class App(tk.Tk):
             if m.startswith("Generating"):
                 self.msgs.put(("message", "Signing with a new random key..."))
         try:
-            self.msgs.put(("done", patch.patch(apk, out, log=log)))
+            result = patch.patch(apk, out, log=log, data_dir=patch.FRAME_DATA_DIR if for_frame else None)
+            self.msgs.put(("built_for_frame", for_frame))
+            self.msgs.put(("done", result))
         except patch.PatchError as e:
             self.msgs.put(("error", str(e)))
         except Exception as e:   # anything unexpected: show it rather than vanish
@@ -467,6 +495,12 @@ class App(tk.Tk):
                 self.adb, self.devs = adb, devs
             elif kind == "devprogress":
                 self.dev_progress = v
+            elif kind == "built_for_frame":
+                self.built_for_frame = v
+            elif kind == "frame":   # connected to a Steam Frame: its build is the one to make
+                self.dev_frame = True
+                if not self.for_frame and self.state != "done":
+                    self.set_frame(True)
             elif kind == "devmsg":
                 self.dev_msg, self.dev_tint = v
             elif kind == "adb":

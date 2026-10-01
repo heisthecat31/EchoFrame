@@ -16,6 +16,7 @@ import hashlib
 import io
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -183,6 +184,34 @@ PROBE_STEAMOS = "; ".join([
 ])
 
 
+class Frame:
+    """A Steam Frame seen through its SteamOS adb: Echo set up by Frame Control as its own
+    Lepton instance (~/Applications/Android/<package>: app.apk, instance.id, shortcut.id).
+    `data` is Echo's private folder, /data/data/<package> inside Lepton, which survives
+    restarts and APK updates; when /sdcard has no game data, EchoQuestXR's libvrapi points
+    Echo there. It belongs to the container's user namespace, so writes go through
+    `podman unshare` (where SteamOS's user is root)."""
+
+    def __init__(self, home, instance, shortcut):
+        self.home, self.instance, self.shortcut = home, instance, shortcut
+        self.app_dir = f"{home}/Applications/Android/{PACKAGE}"
+        self.data = f"{home}/.local/share/Steam/steamapps/compatdata/{instance}/internal/{PACKAGE}"
+        self.stage = f"{home}/.cache/echoquestxr-copy"
+
+
+def frame_info(adb, serial):
+    """A Frame for a Steam Frame's SteamOS adb (instance None if Frame Control hasn't set Echo
+    up), None for an Android headset."""
+    code, out = shell(adb, serial, "grep -q '^ID=steamos' /etc/os-release 2>/dev/null && echo FRAME $HOME "
+                      f"$(cat {LEPTON}/{PACKAGE}/instance.id 2>/dev/null || echo -) "
+                      f"$(cat {LEPTON}/{PACKAGE}/shortcut.id 2>/dev/null || echo -)", timeout=20)
+    parts = out.split()
+    if len(parts) < 4 or parts[0] != "FRAME":
+        return None
+    num = lambda s: s if s.isdigit() else None
+    return Frame(parts[1], num(parts[2]), num(parts[3]))
+
+
 def tool(adb, serial, name, *args, timeout=60):
     """Runs an Android tool (pm, am, logcat...) on the headset, by full path if the shell's
     PATH doesn't have it."""
@@ -200,6 +229,18 @@ def installed(adb, serial):
 def install(adb, serial, apk):
     """('ok' | 'signature' | 'error', message). 'signature': a copy signed with another key
     is installed, so it has to be uninstalled first (the caller asks the player)."""
+    fr = frame_info(adb, serial)
+    if fr:   # Steam Frame: Lepton runs ~/Applications/Android/<package>/app.apk; it rebuilds on change
+        if not fr.instance:
+            return "error", ("Echo VR isn't set up on this Frame yet: send the patched APK with Frame Control "
+                             "once (that makes its Steam shortcut), then Install here.")
+        part = f"{fr.app_dir}/app.apk.part"
+        code, out = run(adb, "-s", serial, "push", apk, part, timeout=900)
+        if code == 0:
+            code, out = shell(adb, serial, f"mv -f '{part}' '{fr.app_dir}/app.apk' && echo moved")
+        if "moved" in out:
+            return "ok", "Installed: Lepton uses the new APK the next time Echo starts."
+        return "error", out.strip().splitlines()[-1] if out.strip() else f"copy failed ({code})"
     code, out = run(adb, "-s", serial, "install", "-r", apk, timeout=600)
     if not_found(out):   # adb install couldn't run the package manager: copy, then pm by path
         tmp = "/data/local/tmp/echoquestxr.apk"
@@ -221,6 +262,13 @@ def uninstall(adb, serial):
 
 def launch(adb, serial):
     """Restarts Echo, with the device log cleared first so saved logs cover this run."""
+    fr = frame_info(adb, serial)
+    if fr:   # Steam Frame: start Echo's Steam shortcut, as the library's Play button does
+        if not fr.shortcut:
+            return False, "No Steam shortcut for Echo on this Frame: start it from the Steam library."
+        game = (int(fr.shortcut) << 32) | 0x02000000
+        code, out = shell(adb, serial, f"nohup steam steam://rungameid/{game} >/dev/null 2>&1 & echo started")
+        return "started" in out, out
     tool(adb, serial, "am", "force-stop", PACKAGE, timeout=20)
     clear_logs(adb, serial)
     code, out = tool(adb, serial, "am", "start", "-n", f"{PACKAGE}/{ACTIVITY}", timeout=30)
@@ -295,17 +343,6 @@ def shell(adb, serial, cmd, timeout=60):
     return run(adb, "-s", serial, "shell", cmd, timeout=timeout)
 
 
-def remote_sizes(adb, serial, folder):
-    """{path: size} of the files under `folder` on the headset."""
-    code, out = shell(adb, serial, f"find '{folder}' -type f -exec stat -c '%s %n' {{}} + 2>/dev/null", timeout=120)
-    sizes = {}
-    for line in out.splitlines():
-        size, _, name = line.partition(" ")
-        if size.isdigit():
-            sizes[name] = int(size)
-    return sizes
-
-
 def push(adb, serial, local, remote, progress=None):
     """adb push one file, reporting progress(bytes on the headset) about once a second."""
     p = subprocess.Popen([adb, "-s", serial, "push", local, remote], stdout=subprocess.PIPE,
@@ -323,14 +360,91 @@ def push(adb, serial, local, remote, progress=None):
         raise IOError(f"copying {os.path.basename(local)} failed: {out.splitlines()[-1] if out else p.returncode}")
 
 
+class Storage:
+    """Echo's storage folder on a headset and how to write it.
+    Android (Quest): /sdcard/Android/media/<package>, through adb's Android shell.
+    Steam Frame: Echo's private folder in its Lepton instance (Frame.data), through SteamOS's
+    adb: files are pushed to ~/.cache first, then moved in and given to Echo's user with
+    `podman unshare`. Either way a copy lands under its final name only once complete."""
+
+    def __init__(self, adb, serial):
+        self.adb, self.serial = adb, serial
+        self.frame = frame_info(adb, serial)
+        if self.frame:
+            if not self.frame.instance:
+                raise IOError("Echo VR isn't set up on this Frame yet: send the patched APK with Frame Control "
+                              "once, then Install here.")
+            self.base, self.stage = self.frame.data, self.frame.stage
+        else:
+            self.base, self.stage = MEDIA, f"{MEDIA}/files/.echoquestxr-copy"
+
+    def sh(self, cmd, timeout=60):
+        """A command on Echo's storage (on a Frame, inside the container's user namespace)."""
+        if self.frame:
+            cmd = "podman unshare sh -c " + shlex.quote(cmd)
+        return shell(self.adb, self.serial, cmd, timeout=timeout)
+
+    def check_writable(self):
+        if self.frame:
+            code, out = self.sh(f"test -d '{self.base}' && echo ok")
+            if "ok" not in out:
+                raise IOError("Echo hasn't made its data folder on this Frame yet: start Echo once from the Steam "
+                              "library (it closes without game data; that's fine), then Install again.")
+            code, out = shell(self.adb, self.serial, f"mkdir -p '{self.stage}' && echo writable")
+        else:
+            code, out = self.sh(f"mkdir -p '{self.stage}' && echo writable")
+        if "writable" not in out:
+            raise IOError("this adb connection can't write to Echo's storage on the headset "
+                          f"({out.strip().splitlines()[-1] if out.strip() else 'no answer'}). "
+                          "Press Save logs and send the file: it records what the connection can reach.")
+
+    def sizes(self, rel):
+        """{relative path: size} of the files under base/rel."""
+        code, out = self.sh(f"cd '{self.base}' && find '{rel}' -type f -exec stat -c '%s %n' {{}} + 2>/dev/null",
+                            timeout=120)
+        found = {}
+        for line in out.splitlines():
+            size, _, name = line.partition(" ")
+            if size.isdigit():
+                found[name] = int(size)
+        return found
+
+    def has_game_data(self):
+        """The installer's check: two folders with 2+ files each."""
+        base = f"{self.base}/files/_data/5932408047/rad15/android"
+        for sub in ("manifests", "packages"):
+            code, out = self.sh(f"ls '{base}/{sub}' 2>/dev/null", timeout=20)
+            if len(out.split()) < 2:
+                return False
+        return True
+
+    def sha256(self, rel):
+        code, out = self.sh(f"sha256sum '{self.base}/{rel}' 2>/dev/null")
+        return (out.split() or [""])[0]
+
+    def put(self, local, rel, progress=None):
+        """Copies a local file to base/rel."""
+        part = f"{self.stage}/{os.path.basename(rel)}"
+        push(self.adb, self.serial, local, part, progress)
+        dest = f"{self.base}/{rel}"
+        own = f" && chown -R --reference='{self.base}' '{self.base}/{rel.split('/')[0]}'" if self.frame else ""
+        code, out = self.sh(f"mkdir -p '{dest.rsplit('/', 1)[0]}' && mv -f '{part}' '{dest}'{own} && echo moved")
+        if "moved" not in out:
+            raise IOError(f"couldn't move {rel} into place on the headset: {out.strip()}")
+
+    def remove(self, rel):
+        self.sh(f"rm -f '{self.base}/{rel}'")
+
+    def done(self):
+        if self.frame:
+            shell(self.adb, self.serial, f"rm -rf '{self.stage}'")
+        else:
+            self.sh(f"rm -rf '{self.stage}'")
+
+
 def game_data_on_headset(adb, serial):
     """True when the headset has the game data the installer checks for (two folders, 2+ files each)."""
-    base = f"{MEDIA}/files/_data/5932408047/rad15/android"
-    for sub in ("manifests", "packages"):
-        code, out = shell(adb, serial, f"ls '{base}/{sub}' 2>/dev/null", timeout=20)
-        if len(out.split()) < 2:
-            return False
-    return True
+    return Storage(adb, serial).has_game_data()
 
 
 def install_game_data(adb, serial, log=print, progress=None):
@@ -340,21 +454,17 @@ def install_game_data(adb, serial, log=print, progress=None):
     cache = os.path.join(DATA, "cache")
     os.makedirs(cache, exist_ok=True)
     zpath = os.path.join(cache, "_data.zip")
-    if game_data_on_headset(adb, serial):
+    store = Storage(adb, serial)
+    if store.frame:
+        log(f"Steam Frame: Echo's storage is {store.base}")
+    if store.has_game_data():
         # Never copy over an existing install: Echo updates its data itself (a headset can
         # hold newer manifests and extra packages than the zip), so the zip could downgrade it
         say(0.96, "Game data is already on the headset. Checking the asset patches...")
-        install_asset_patches(adb, serial, cache, log)
+        install_asset_patches(store, cache, log)
         say(1.0, "Game data is already on the headset; asset patches up to date.")
         return
-
-    # Before 900 MB of downloading: can this adb connection write to Echo's folder at all?
-    # (Steam Frame's can be a Linux shell that sees Android storage read-only.)
-    code, out = shell(adb, serial, f"mkdir -p '{MEDIA}/files/.echoquestxr-copy' && echo writable")
-    if "writable" not in out:
-        raise IOError("this adb connection can't write to Echo's storage on the headset "
-                      f"({out.strip().splitlines()[-1] if out.strip() else 'no answer'}). "
-                      "Press Save logs and send the file: it records what the connection can reach.")
+    store.check_writable()   # before 900 MB of downloading
 
     if not (os.path.isfile(zpath) and zipfile.is_zipfile(zpath)):
         if shutil.disk_usage(cache).free < 2_200_000_000:
@@ -378,42 +488,37 @@ def install_game_data(adb, serial, log=print, progress=None):
         for i in files:
             if not SAFE_PATH.match(i.filename) or ".." in i.filename:
                 raise IOError(f"unexpected file in the game data: {i.filename}")
-        there = remote_sizes(adb, serial, f"{MEDIA}/files/_data")
+        there = store.sizes("files/_data")
         total = sum(i.file_size for i in files) or 1
         done = 0
         tmpdir = os.path.join(cache, "push")
         for n, i in enumerate(files, 1):
-            remote = f"{MEDIA}/files/{i.filename}"
+            rel = f"files/{i.filename}"
             label = f"Copying game data to the headset (file {n} of {len(files)})"
-            if there.get(remote) != i.file_size:   # already there with the right size: skip
+            if there.get(rel) != i.file_size:   # already there with the right size: skip
                 say(0.5 + 0.45 * done / total, label + ": unpacking...")
                 local = z.extract(i, tmpdir)
-                # into a side folder first, then moved: a cut-off copy never looks installed
-                part = f"{MEDIA}/files/.echoquestxr-copy/{os.path.basename(i.filename)}"
                 try:
-                    push(adb, serial, local, part,
-                         lambda b, d=done: say(0.5 + 0.45 * (d + b) / total,
-                                               f"{label}: {(d + b) / 1e6:.0f} of {total / 1e6:.0f} MB"))
+                    store.put(local, rel, lambda b, d=done: say(0.5 + 0.45 * (d + b) / total,
+                                                                f"{label}: {(d + b) / 1e6:.0f} of {total / 1e6:.0f} MB"))
                 finally:
                     os.remove(local)
-                code, out = shell(adb, serial, f"mkdir -p '{remote.rsplit('/', 1)[0]}' && mv -f '{part}' '{remote}'")
-                if code != 0:
-                    raise IOError(f"couldn't move {i.filename} into place on the headset: {out}")
             done += i.file_size
             say(0.5 + 0.45 * done / total, label)
         shutil.rmtree(tmpdir, ignore_errors=True)
-        shell(adb, serial, f"rm -rf '{MEDIA}/files/.echoquestxr-copy'")
-    if not game_data_on_headset(adb, serial):
+    if not store.has_game_data():
         raise IOError("the game data was copied, but the headset doesn't show all of it")
 
     say(0.96, "Applying asset patches...")
-    install_asset_patches(adb, serial, cache, log)
+    install_asset_patches(store, cache, log)
+    store.done()
     os.remove(zpath)   # on the headset now: give the PC its 900 MB back
     say(1.0, "Game data installed.")
 
 
-def install_asset_patches(adb, serial, cache, log=print):
-    """The Echo VR installer's mod patches: files listed in its update manifest, sha256-checked."""
+def install_asset_patches(store, cache, log=print):
+    """The Echo VR installer's mod patches: files listed in its update manifest, sha256-checked,
+    relative to Echo's storage folder."""
     with urllib.request.urlopen(urllib.request.Request(PATCH_MANIFEST_URL, headers=UA), timeout=30) as r:
         text = r.read().decode("utf-8", "replace")
     base = re.search(r"^#\s*Base URL:\s*(\S+)", text, re.M)
@@ -428,13 +533,11 @@ def install_asset_patches(adb, serial, cache, log=print):
         op, path = parts[0].lower(), parts[1]
         if not SAFE_PATH.match(path) or ".." in path:
             raise IOError(f"unexpected path in the asset patch list: {path}")
-        remote = f"{MEDIA}/{path}"
         if op == "del":
-            shell(adb, serial, f"rm -f '{remote}'")
+            store.remove(path)
         elif op == "add" and len(parts) >= 3:
             want = parts[2].lower()
-            code, out = shell(adb, serial, f"sha256sum '{remote}' 2>/dev/null")
-            if out.split()[:1] == [want]:
+            if store.sha256(path) == want:
                 continue
             local = os.path.join(cache, "patch-" + want)
             fetch(f"{base}/{path}", local)
@@ -443,7 +546,7 @@ def install_asset_patches(adb, serial, cache, log=print):
             try:
                 if not ok:
                     raise IOError(f"asset patch {path} didn't match its checksum")
-                push(adb, serial, local, remote)
+                store.put(local, path)
             finally:
                 os.remove(local)
             log(f"  patched {path}")

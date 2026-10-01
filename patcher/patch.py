@@ -1,6 +1,6 @@
 """EchoQuestXR patcher: turns your Echo VR Quest APK into one that runs on OpenXR.
 
-    python patch.py <echo.apk> [-o <out.apk>]      (or use gui.pyw)
+    python patch.py <echo.apk> [-o <out.apk>] [--frame]   (or use gui.pyw)
 
 The changes (changes() below; runtime/build.py makes the same ones):
   lib/arm64-v8a/libvrapi.so         replaced by the EchoQuestXR runtime (VrApi on OpenXR)
@@ -8,6 +8,8 @@ The changes (changes() below; runtime/build.py makes the same ones):
   AndroidManifest.xml               Echo's activity becomes a LAUNCHER entry (Lepton on
                                     Steam Frame needs it) and the OpenXR permissions are
                                     declared (axml.py)
+  libr15.so, libassetpatch.so       Steam Frame build only (--frame): the game data path
+                                    becomes Echo's private folder (relocate())
 Everything else in the APK is copied unchanged.
 
 The result is signed with a NEW random key every time (RSA-2048, self-signed), so no two
@@ -42,6 +44,13 @@ RUNTIME_FILES = ("libvrapi.so", "libopenxr_loader.so")
 # Meta's VrApi loader 1.1.40 as shipped in Echo VR build 4987566
 META_VRAPI_SHA256 = "43bec081aae29781389823f690b5f63932905f76cb96452474a65ef8c16fd3e6"
 SIGNATURE_FILES = (".SF", ".RSA", ".DSA", ".EC")
+# Where community-patched Echo reads its game data, spelled out in these libraries. On Steam
+# Frame, Lepton's /sdcard can't be written from SteamOS and is rebuilt with its Android
+# snapshot, so the Frame build reads from Echo's private folder, which Lepton keeps (on the
+# Frame: ~/.local/share/Steam/steamapps/compatdata/<instance>/internal/<package>).
+MEDIA_DIR = "/sdcard/Android/media/com.readyatdawn.r15"
+FRAME_DATA_DIR = "/data/data/com.readyatdawn.r15"
+DATA_DIR_LIBS = ("libr15.so", "libassetpatch.so")
 
 
 class PatchError(Exception):
@@ -137,21 +146,51 @@ def _aligned(zout, info, data, align):
     zout.writestr(info, data)
 
 
-def changes(apk, runtime, log=print):
-    """{entry name: new bytes}: every change EchoQuestXR makes to an Echo VR APK."""
+def relocate(data, new_dir):
+    """Every MEDIA_DIR in a library's bytes, pointed at new_dir (shorter, so each string keeps
+    its place: what follows the path moves up and the freed bytes become zeros). Returns
+    (new bytes, count)."""
+    old, new = MEDIA_DIR.encode(), new_dir.encode()
+    if len(new) > len(old):
+        raise PatchError(f"{new_dir} is longer than {MEDIA_DIR}, so it can't replace it in place")
+    data = bytearray(data)
+    count, i = 0, data.find(old)
+    while i >= 0:
+        end = data.index(0, i)   # the end of this string
+        rest = bytes(data[i + len(old):end])
+        data[i:end] = new + rest + b"\0" * (len(old) - len(new))
+        count += 1
+        i = data.find(old, i + len(new) + len(rest))
+    return bytes(data), count
+
+
+def changes(apk, runtime, log=print, data_dir=None):
+    """{entry name: new bytes}: every change EchoQuestXR makes to an Echo VR APK. data_dir:
+    where Echo reads its game data instead of /sdcard/Android/media/<package> (Steam Frame:
+    FRAME_DATA_DIR)."""
     out = {LIB + f: open(os.path.join(runtime, f), "rb").read() for f in RUNTIME_FILES}
     with zipfile.ZipFile(apk) as z:
         out["AndroidManifest.xml"] = axml.patch_manifest(z.read("AndroidManifest.xml"), log)
+        if data_dir:
+            names = set(z.namelist())
+            total = 0
+            for lib in DATA_DIR_LIBS:
+                if LIB + lib in names:
+                    out[LIB + lib], n = relocate(z.read(LIB + lib), data_dir)
+                    log(f"  {lib}: {n} game data path(s) now {data_dir}")
+                    total += n
+            if not total:
+                raise PatchError(f"No {MEDIA_DIR} paths found to change: is this a community-patched Echo VR APK?")
     return out
 
 
-def patch(apk, out, log=print):
+def patch(apk, out, log=print, data_dir=None):
     log(f"Reading {apk}")
     log(f"  {inspect(apk)}")
     runtime = find_runtime()
     log(f"Runtime: {runtime}")
     try:
-        replace = changes(apk, runtime, log)
+        replace = changes(apk, runtime, log, data_dir)
     except axml.AxmlError as e:
         raise PatchError(f"Couldn't update AndroidManifest.xml: {e}")
 
@@ -164,13 +203,14 @@ def patch(apk, out, log=print):
                 continue
             new = zipfile.ZipInfo(n, info.date_time)
             new.compress_type, new.external_attr = info.compress_type, info.external_attr
+            if n in replace and n != LIB + "libopenxr_loader.so":
+                log(f"  replaced {n}")
             entries.append((new, replace.pop(n) if n in replace else zin.read(n)))
     for n, data in replace.items():   # libopenxr_loader.so (new)
         info = zipfile.ZipInfo(n, template.date_time)
         info.compress_type, info.external_attr = template.compress_type, template.external_attr
         entries.append((info, data))
         log(f"  added {n}")
-    log(f"  replaced {LIB}libvrapi.so")
 
     log("Generating a new random signing key...")
     key, cert = new_key()
@@ -206,10 +246,13 @@ def main():
     ap = argparse.ArgumentParser(description="Patch an Echo VR Quest APK to run on OpenXR.")
     ap.add_argument("apk")
     ap.add_argument("-o", "--out")
+    ap.add_argument("--frame", action="store_true", help=f"Steam Frame build: game data in {FRAME_DATA_DIR}")
+    ap.add_argument("--data-dir", help="game data folder to use instead (testing)")
     a = ap.parse_args()
-    out = a.out or os.path.splitext(a.apk)[0] + "_openxr.apk"
+    data_dir = a.data_dir or (FRAME_DATA_DIR if a.frame else None)
+    out = a.out or os.path.splitext(a.apk)[0] + ("_openxr_frame.apk" if a.frame else "_openxr.apk")
     try:
-        patch(a.apk, out)
+        patch(a.apk, out, data_dir=data_dir)
     except PatchError as e:
         sys.exit(f"error: {e}")
 

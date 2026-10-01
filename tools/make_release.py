@@ -36,11 +36,15 @@ untested so far, on Steam Frame and other OpenXR headsets.
      debugging first. Android only updates an app signed with the same key, so the
      window asks before uninstalling an Echo VR signed with another key (that removes
      Echo's app data on the headset; the game files normally stay).
-   - Steam Frame: enable Developer Mode on the Frame and let Frame Control
-     (https://github.com/saphid/frame-control) connect. Then in the window press
-     Connect... and enter the adb address Frame Control shows (IP:port), and Install.
-     (Or install the APK file with Frame Control itself, then Install here for the
-     game data.) Echo appears in your Steam library.
+   - Steam Frame: tick "For Steam Frame" before Patch and sign (Echo then keeps its
+     game data in its private folder, which the Frame keeps).
+     a. In Steam on the Frame, install "Lepton Development" (Steam app 3056000).
+     b. Enable Developer Mode, let Frame Control
+        (https://github.com/saphid/frame-control) connect, and send it the patched
+        APK once. Echo appears in your Steam library.
+     c. Start Echo once from the library (it closes without game data; that's fine).
+     d. In this window: Connect... with the adb address Frame Control shows (IP:port),
+        then Install (APK and game data), Launch, Save logs.
 
 Game data: with "Install also copies Echo's game data" ticked (the default), Install
 also downloads Echo's game data (about 900 MB, once; from the same mirrors as the

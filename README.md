@@ -129,9 +129,28 @@ Ready on the EchoQuestXR side, untested on a Frame:
   d-pad down/up as X/Y, View as menu), Valve Index and the generic simple controller, as
   well as Touch.
 
-To try it: sideload the patched APK through Lepton (Frame Control does this, or the
-patcher's Install over Connect...), get the game data onto it (Install, above), then read
-`adb logcat -s EchoQuestXR` from the Frame (Save logs). The first lines list the OpenXR extensions,
+How it fits Lepton (from [Frame Control](https://github.com/saphid/frame-control)'s
+`docs/apks.md` and what the Frame reported):
+- Frame Control sets Echo up as its own Lepton instance: `~/Applications/Android/com.readyatdawn.r15/`
+  holds `app.apk`, `launch.sh`, `instance.id` and `shortcut.id`, plus a Steam shortcut.
+  `launch.sh` needs **Lepton Development** (Steam app 3056000) installed in the main Steam library.
+- Echo runs in podman container `lepton-steamlaunch-<instance.id>`. Only `~/.local/share/Steam`
+  is mounted in it. Lepton's `/sdcard` is rebuilt with its Android snapshot, but Echo's private
+  folder `/data/data/com.readyatdawn.r15` is kept, as
+  `~/.local/share/Steam/steamapps/compatdata/<instance.id>/internal/com.readyatdawn.r15`.
+- The Frame's adb (Frame Control's address) is a SteamOS shell, not Android's.
+
+So the Frame build (**For Steam Frame** in the window, `patch.py --frame`) changes every
+`/sdcard/Android/media/com.readyatdawn.r15` in `libr15.so` and `libassetpatch.so` to
+`/data/data/com.readyatdawn.r15`, in place (the new path is shorter). Over the Frame's adb the
+window then: **Install** replaces `app.apk` and copies the game data into that private folder
+(through `podman unshare`, owned by Echo's user); **Launch** starts the Steam shortcut;
+**Save logs** runs `logcat` inside Echo's container. Echo has to have started once so its
+private folder exists.
+
+1. Install Lepton Development, and send the Frame build's APK with Frame Control once.
+2. Start Echo once from the Steam library (it closes without data).
+3. In the window: Connect... (Frame Control's address), Install, Launch, Save logs. The first lines list the OpenXR extensions,
 the Vulkan extensions left out, and any swapchain-format problem.
 
 ## Not done yet
