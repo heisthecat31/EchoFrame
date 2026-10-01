@@ -142,7 +142,10 @@ How it fits Lepton (from [Frame Control](https://github.com/saphid/frame-control
 
 So the Frame build (**For Steam Frame** in the window, `patch.py --frame`) changes every
 `/sdcard/Android/media/com.readyatdawn.r15` in `libr15.so` and `libassetpatch.so` to
-`/data/data/com.readyatdawn.r15`, in place (the new path is shorter). Over the Frame's adb the
+`/data/data/com.readyatdawn.r15`, in place (the new path is shorter). It also changes one
+instruction in Echo's `CGS::Initialize`: Echo asks for Vulkan apiVersion 1 (that is 0.0.1),
+which Quest's driver accepts but the Frame's Mesa driver doesn't (no core functions, then
+`VK_ERROR_INCOMPATIBLE_DRIVER`); the Frame build asks for 1.0. Over the Frame's adb the
 window then: **Install** replaces `app.apk` and copies the game data into that private folder
 (through `podman unshare`, owned by Echo's user); **Launch** starts the Steam shortcut;
 **Save logs** runs `logcat` inside Echo's container. Echo has to have started once so its

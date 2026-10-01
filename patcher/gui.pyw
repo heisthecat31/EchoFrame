@@ -183,8 +183,8 @@ class App(tk.Tk):
         self.text(52, y + 36, self.out or "Chosen after you pick the APK", "small", TEXT if self.out else FAINT, width=W - 200)
         self.button(W - 140, y + 18, 88, 34, "Change", "out", enabled=bool(self.apk) and self.state != "working")
         box = "☑" if self.for_frame else "☐"
-        self.text(52, y + 66, f"{box}  For Steam Frame: Echo reads its game data from its private folder "
-                  f"({patch.FRAME_DATA_DIR})", "small",
+        self.text(52, y + 66, f"{box}  For Steam Frame: game data from Echo's private folder "
+                  f"({patch.FRAME_DATA_DIR}), Vulkan 1.0 for its driver", "small",
                   ACCENT if self.hot == "frame" else (TEXT if self.for_frame else MUTED), tags=("frame",))
 
         # status / result area
@@ -465,7 +465,7 @@ class App(tk.Tk):
             if m.startswith("Generating"):
                 self.msgs.put(("message", "Signing with a new random key..."))
         try:
-            result = patch.patch(apk, out, log=log, data_dir=patch.FRAME_DATA_DIR if for_frame else None)
+            result = patch.patch(apk, out, log=log, frame=for_frame)
             self.msgs.put(("built_for_frame", for_frame))
             self.msgs.put(("done", result))
         except patch.PatchError as e:

@@ -9,7 +9,8 @@ The changes (changes() below; runtime/build.py makes the same ones):
                                     Steam Frame needs it) and the OpenXR permissions are
                                     declared (axml.py)
   libr15.so, libassetpatch.so       Steam Frame build only (--frame): the game data path
-                                    becomes Echo's private folder (relocate())
+                                    becomes Echo's private folder (relocate()), and
+                                    Echo asks for Vulkan 1.0 (vulkan_1_0())
 Everything else in the APK is copied unchanged.
 
 The result is signed with a NEW random key every time (RSA-2048, self-signed), so no two
@@ -51,6 +52,13 @@ SIGNATURE_FILES = (".SF", ".RSA", ".DSA", ".EC")
 MEDIA_DIR = "/sdcard/Android/media/com.readyatdawn.r15"
 FRAME_DATA_DIR = "/data/data/com.readyatdawn.r15"
 DATA_DIR_LIBS = ("libr15.so", "libassetpatch.so")
+# Echo's CGS::Initialize sets VkApplicationInfo engineVersion and apiVersion with one
+# `movi v0.2s, #0x1`: apiVersion 1 is version 0.0.1. Quest's driver takes it; Mesa (Steam
+# Frame) treats it as older than 1.0 and exposes no core functions, so vkCreateInstance
+# fails with VK_ERROR_INCOMPATIBLE_DRIVER. `movi v0.2s, #0x40, lsl #16` makes both 0x400000,
+# Vulkan 1.0. Matched on that instruction and the three after it, which must occur once.
+VK_API_OLD = bytes.fromhex("2004000f" "283300b9" "e8a32e91" "00001e91")
+VK_API_NEW = bytes.fromhex("0044020f")
 
 
 class PatchError(Exception):
@@ -164,19 +172,30 @@ def relocate(data, new_dir):
     return bytes(data), count
 
 
-def changes(apk, runtime, log=print, data_dir=None):
+def vulkan_1_0(data):
+    """libr15.so asking for Vulkan 1.0 instead of 0.0.1 (VK_API_OLD above)."""
+    i = data.find(VK_API_OLD)
+    if i < 0 or data.find(VK_API_OLD, i + 1) >= 0:
+        raise PatchError("Couldn't find Echo's Vulkan version setting in libr15.so (made for build 4987566)")
+    return data[:i] + VK_API_NEW + data[i + len(VK_API_NEW):]
+
+
+def changes(apk, runtime, log=print, data_dir=None, vk_1_0=False):
     """{entry name: new bytes}: every change EchoQuestXR makes to an Echo VR APK. data_dir:
-    where Echo reads its game data instead of /sdcard/Android/media/<package> (Steam Frame:
-    FRAME_DATA_DIR)."""
+    where Echo reads its game data instead of /sdcard/Android/media/<package>; vk_1_0: Echo
+    asks for Vulkan 1.0 (VK_API_OLD). The Steam Frame build does both (FRAME_DATA_DIR)."""
     out = {LIB + f: open(os.path.join(runtime, f), "rb").read() for f in RUNTIME_FILES}
     with zipfile.ZipFile(apk) as z:
         out["AndroidManifest.xml"] = axml.patch_manifest(z.read("AndroidManifest.xml"), log)
+        if vk_1_0:
+            out[LIB + "libr15.so"] = vulkan_1_0(z.read(LIB + "libr15.so"))
+            log("  libr15.so: asks for Vulkan 1.0 (was 0.0.1, which Mesa refuses)")
         if data_dir:
             names = set(z.namelist())
             total = 0
             for lib in DATA_DIR_LIBS:
                 if LIB + lib in names:
-                    out[LIB + lib], n = relocate(z.read(LIB + lib), data_dir)
+                    out[LIB + lib], n = relocate(out.get(LIB + lib) or z.read(LIB + lib), data_dir)
                     log(f"  {lib}: {n} game data path(s) now {data_dir}")
                     total += n
             if not total:
@@ -184,13 +203,15 @@ def changes(apk, runtime, log=print, data_dir=None):
     return out
 
 
-def patch(apk, out, log=print, data_dir=None):
+def patch(apk, out, log=print, data_dir=None, frame=False):
+    """frame: the Steam Frame build (game data in FRAME_DATA_DIR unless data_dir says otherwise,
+    Vulkan 1.0)."""
     log(f"Reading {apk}")
     log(f"  {inspect(apk)}")
     runtime = find_runtime()
     log(f"Runtime: {runtime}")
     try:
-        replace = changes(apk, runtime, log, data_dir)
+        replace = changes(apk, runtime, log, data_dir or (FRAME_DATA_DIR if frame else None), vk_1_0=frame)
     except axml.AxmlError as e:
         raise PatchError(f"Couldn't update AndroidManifest.xml: {e}")
 
@@ -246,13 +267,13 @@ def main():
     ap = argparse.ArgumentParser(description="Patch an Echo VR Quest APK to run on OpenXR.")
     ap.add_argument("apk")
     ap.add_argument("-o", "--out")
-    ap.add_argument("--frame", action="store_true", help=f"Steam Frame build: game data in {FRAME_DATA_DIR}")
+    ap.add_argument("--frame", action="store_true",
+                    help=f"Steam Frame build: game data in {FRAME_DATA_DIR}, Vulkan 1.0")
     ap.add_argument("--data-dir", help="game data folder to use instead (testing)")
     a = ap.parse_args()
-    data_dir = a.data_dir or (FRAME_DATA_DIR if a.frame else None)
     out = a.out or os.path.splitext(a.apk)[0] + ("_openxr_frame.apk" if a.frame else "_openxr.apk")
     try:
-        patch(a.apk, out, data_dir=data_dir)
+        patch(a.apk, out, data_dir=a.data_dir, frame=a.frame)
     except PatchError as e:
         sys.exit(f"error: {e}")
 
