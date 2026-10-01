@@ -162,6 +162,13 @@ PROBE_STEAMOS = "; ".join([
     "S=$HOME/.local/share/Steam; echo instance=$ID container=$C",
     "echo '## steam dir'", "readlink -f $S; ls -la $HOME/.local/share/ 2>&1 | grep -i steam",
     "echo '## lepton (followed)'", "ls -la $S/steamapps/common/Lepton/ 2>&1 | head -30",
+    # launch.sh only looks in the home Steam library; Lepton is Steam app 3056000
+    "echo '## steam libraries'", "grep -E '\"path\"|\"3056000\"' $S/steamapps/libraryfolders.vdf 2>&1 | head -20",
+    "ls $S/steamapps/appmanifest_3056000.acf 2>&1; ls $S/steamapps/common/ 2>&1 | head -40",
+    "for L in $(grep '\"path\"' $S/steamapps/libraryfolders.vdf 2>/dev/null | cut -d'\"' -f4); do "
+    "ls -d \"$L/steamapps/common/Lepton\" \"$L/steamapps/appmanifest_3056000.acf\" 2>/dev/null; done",
+    "find / \\( -path /proc -o -path /sys -o -path /dev \\) -prune -o -maxdepth 9 -type f -name lepton -print "
+    "2>/dev/null | head -10",
     "echo '## compatdata'", "find -L $S/steamapps/compatdata/$ID -maxdepth 8 -type d 2>/dev/null | head -100",
     "echo '## echo data (followed)'", "find -L $S -maxdepth 14 \\( -name com.readyatdawn.r15 -o -name _data \\) "
     "-type d 2>/dev/null | head -20",
