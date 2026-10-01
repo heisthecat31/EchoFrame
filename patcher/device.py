@@ -102,7 +102,34 @@ def connect(adb, target):
 
 
 def not_found(out):
-    return "not found" in out or "inaccessible" in out
+    low = out.lower()
+    return any(s in low for s in ("not found", "inaccessible", "no such file or directory"))
+
+
+# What a headset shell is, for when it isn't the Android shell adb normally gives (on Steam
+# Frame it can be a plain Linux shell outside Lepton's Android): system, where Android and
+# its tools are, what runs. Read-only.
+PROBE = "; ".join([
+    "echo '## shell'", "echo PATH=$PATH", "id", "uname -a", "cat /etc/os-release 2>/dev/null | head -4",
+    "echo '## tools'", "for t in logcat am pm getprop waydroid lxc-attach lxc-ls nsenter podman docker; "
+    "do printf '%s: ' $t; command -v $t || echo -; done",
+    "echo '## root'", "ls / 2>&1",
+    "echo '## android dirs'", "ls -d /system /system/bin /data /sdcard /storage /apex /var/lib/waydroid "
+    "/var/lib/lepton* /opt/* 2>&1",
+    "echo '## storage'", "echo HOME=$HOME; pwd", "ls -ld /sdcard /sdcard/ /sdcard/Android /sdcard/Android/media /storage/emulated/0 2>&1",
+    f"ls -la {MEDIA} 2>&1 | head -10",
+    "mount 2>/dev/null | grep -iE 'sdcard|storage|media|/data|emulated|lepton|android' | head -25",
+    "df 2>/dev/null | head -20",
+    "for d in /sdcard/Android/media /storage/emulated/0/Android/media /data/local/tmp /data/media/0 $HOME /tmp; "
+    "do if touch \"$d/.eqx-probe\" 2>/dev/null; then rm -f \"$d/.eqx-probe\"; echo \"writable: $d\"; "
+    "else echo \"read-only/missing: $d\"; fi; done",
+    "echo '## logcat binaries'", "find / \\( -path /proc -o -path /sys -o -path /dev \\) -prune -o -maxdepth 7 "
+    "-name logcat -type f -print 2>/dev/null | head -10",
+    "echo '## echo media folders'", "find / \\( -path /proc -o -path /sys -o -path /dev \\) -prune -o -maxdepth 9 "
+    "-type d -name com.readyatdawn.r15 -print 2>/dev/null | head -10",
+    "echo '## processes'", "ps -eo pid,user,comm 2>/dev/null | grep -iE 'lepton|android|logd|adbd|zygote|surfaceflinger|"
+    "lxc|r15|crun|bwrap' | head -30",
+])
 
 
 def tool(adb, serial, name, *args, timeout=60):
@@ -155,12 +182,20 @@ def save_logs(adb, serial, path):
     log says why. Returns the number of lines."""
     code, out = tool(adb, serial, "logcat", "-d", "-v", "time", *LOG_TAGS, timeout=60)
     if not_found(out):
-        probe = ("echo PATH=$PATH; id; uname -a; getprop ro.product.model; getprop ro.build.version.release; "
-                 "ls -d /system/bin /system/bin/logcat /sdcard/Android/media 2>&1; "
-                 f"ls {MEDIA} 2>&1; ls /system/bin 2>&1 | head -40")
-        code, diag = run(adb, "-s", serial, "shell", probe, timeout=30)
-        out = ("logcat couldn't run on this headset (" + out.strip().splitlines()[-1] + ").\n"
-               "What adb is connected to:\n" + diag)
+        first = out.strip().splitlines()[-1] if out.strip() else "no output"
+        code, diag = run(adb, "-s", serial, "shell", PROBE, timeout=90)
+        found = diag.split("## logcat binaries", 1)[-1].split("##", 1)[0].split()
+        tried = []
+        for exe in (f for f in found if f.startswith("/")):   # a logcat elsewhere (inside a container)
+            code, got = run(adb, "-s", serial, "shell", exe, "-d", "-v", "time", *LOG_TAGS, timeout=60)
+            tried.append(f"{exe}: {(got.strip().splitlines() or ['no output'])[0][:200]}")
+            if code == 0 and not not_found(got):
+                out = f"(logcat from {exe})\n" + got
+                break
+        else:
+            out = ("logcat couldn't run through this adb connection (" + first + ").\n"
+                   "It isn't Android's shell. What it is:\n\n" + diag +
+                   ("\n## other logcats tried\n" + "\n".join(tried) if tried else ""))
     lines = [l for l in out.splitlines() if "/RAD" not in l]
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -252,6 +287,14 @@ def install_game_data(adb, serial, log=print, progress=None):
         install_asset_patches(adb, serial, cache, log)
         say(1.0, "Game data is already on the headset; asset patches up to date.")
         return
+
+    # Before 900 MB of downloading: can this adb connection write to Echo's folder at all?
+    # (Steam Frame's can be a Linux shell that sees Android storage read-only.)
+    code, out = shell(adb, serial, f"mkdir -p '{MEDIA}/files/.echoquestxr-copy' && echo writable")
+    if "writable" not in out:
+        raise IOError("this adb connection can't write to Echo's storage on the headset "
+                      f"({out.strip().splitlines()[-1] if out.strip() else 'no answer'}). "
+                      "Press Save logs and send the file: it records what the connection can reach.")
 
     if not (os.path.isfile(zpath) and zipfile.is_zipfile(zpath)):
         if shutil.disk_usage(cache).free < 2_200_000_000:
