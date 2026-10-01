@@ -14,6 +14,9 @@ import urllib.request
 import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# Where a downloaded adb lives: next to the scripts, or for the packaged .exe (which
+# unpacks to a temporary folder) in %LOCALAPPDATA%\EchoQuestXR.
+DATA = os.path.join(os.environ.get("LOCALAPPDATA", HERE), "EchoQuestXR") if getattr(sys, "frozen", False) else HERE
 PACKAGE = "com.readyatdawn.r15"
 ACTIVITY = "com.oculus.gles3jni.MainActivity"
 # Google's official Android platform-tools (adb)
@@ -27,7 +30,7 @@ def find_adb():
     """adb from the patcher folder, PATH, or the usual Android SDK places; None if missing."""
     exe = "adb.exe" if sys.platform == "win32" else "adb"
     local = os.environ.get("LOCALAPPDATA", "")
-    candidates = [os.path.join(HERE, "platform-tools", exe), shutil.which("adb") or ""]
+    candidates = [os.path.join(DATA, "platform-tools", exe), shutil.which("adb") or ""]
     for root in (os.environ.get("ANDROID_HOME"), os.environ.get("ANDROID_SDK_ROOT"),
                  os.path.join(local, "Android", "Sdk") if local else None, r"J:\AndroidSDK", r"C:\Android\Sdk"):
         if root:
@@ -39,11 +42,12 @@ def find_adb():
 
 
 def download_adb(log=print):
-    """Fetches Google's platform-tools into patcher/platform-tools/. Returns the adb path."""
+    """Fetches Google's platform-tools into <DATA>/platform-tools/. Returns the adb path."""
     log("Downloading Android platform-tools from Google...")
     with urllib.request.urlopen(PLATFORM_TOOLS_URL, timeout=60) as r:
         data = r.read()
-    zipfile.ZipFile(io.BytesIO(data)).extractall(HERE)   # creates platform-tools/
+    os.makedirs(DATA, exist_ok=True)
+    zipfile.ZipFile(io.BytesIO(data)).extractall(DATA)   # creates platform-tools/
     adb = find_adb()
     if not adb:
         raise RuntimeError("platform-tools downloaded, but adb isn't in it")

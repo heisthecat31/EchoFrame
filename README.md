@@ -52,6 +52,17 @@ adb install <your-echo>_openxr.apk
 The patcher needs the two runtime libraries: in `patcher/runtime/` (a release puts them
 there), or built from source into `build/` (below).
 
+## Windows release
+
+```bash
+python tools/make_release.py        # build/release/EchoQuestXR-Patcher-v<VERSION>.exe and .zip
+```
+
+A standalone `.exe` (PyInstaller): the patcher window with the runtime libraries inside, so
+users need nothing else. The zip adds README.txt and THIRD_PARTY_NOTICES.txt. Needs
+everything the runtime build needs, plus `cryptography`, Pillow and PyInstaller. The version
+is in `VERSION`.
+
 ## Building the runtime (`runtime/`)
 
 Needs the Android NDK (default `J:\AndroidSDK`, or set `ANDROID_HOME`), CMake, Ninja and the

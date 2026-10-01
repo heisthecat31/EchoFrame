@@ -24,6 +24,20 @@ TEXT, MUTED, FAINT = "#eef0f4", "#8e95a3", "#5a6170"
 ACCENT, ACCENT2, GOOD, WARN, BAD = "#5b8cff", "#9a6bff", "#3ddc97", "#ffb547", "#ff5d6c"
 W, H = 720, 690
 
+
+def _version():
+    """The release version: VERSION next to this file (packaged .exe) or at the repo root."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for p in (os.path.join(here, "VERSION"), os.path.join(here, "..", "VERSION")):
+        try:
+            return "v" + open(p, encoding="utf-8").read().strip()
+        except OSError:
+            pass
+    return ""
+
+
+VERSION = _version()
+
 if sys.platform == "win32":   # crisp on scaled displays
     try:
         import ctypes
@@ -42,7 +56,13 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.s = self.winfo_fpixels("1i") / 96.0   # logical px -> screen px
-        self.title("EchoQuestXR")
+        self.title(f"EchoQuestXR {VERSION}".strip())
+        icon = os.path.join(os.path.dirname(os.path.abspath(__file__)), "echoquestxr.ico")
+        if os.path.isfile(icon):
+            try:
+                self.iconbitmap(icon)
+            except tk.TclError:
+                pass
         self.configure(bg=BG)
         self.resizable(False, False)
         self.geometry(f"{self.px(W)}x{self.px(H)}")
@@ -322,7 +342,7 @@ class App(tk.Tk):
     def headset_click(self, t):
         if t == "getadb":
             if messagebox.askyesno("EchoQuestXR", "Download Android platform-tools (adb, about 7 MB) from Google "
-                                   "(dl.google.com) into the patcher folder?"):
+                                   f"(dl.google.com) into {device.DATA}?"):
                 self.dev_job(self.job_getadb)
             return
         serial = self.devs[0][0] if self.devs else None
@@ -417,4 +437,10 @@ class App(tk.Tk):
 
 if __name__ == "__main__":
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
+    if len(sys.argv) == 4 and sys.argv[1] == "--patch":   # headless: --patch <in.apk> <out.apk>
+        try:
+            patch.patch(sys.argv[2], sys.argv[3], log=lambda m: None)
+        except Exception:
+            sys.exit(1)
+        sys.exit(0)
     App().mainloop()
