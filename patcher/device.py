@@ -146,6 +146,15 @@ PROBE_STEAMOS = "; ".join([
     "'android|lepton|r15|binder|bwrap|crun|conmon|podman|zygote|logd' | grep -v grep | cut -c1-200 | head -30",
     "echo '## log files'", "find $HOME /tmp /run/user/$(id -u) /var/log -maxdepth 6 \\( -iname '*lepton*' "
     "-o -iname '*logcat*' -o -iname '*android*.log' \\) 2>/dev/null | head -30",
+    "echo '## launch.sh'", f"head -c 4000 {LEPTON}/{PACKAGE}/launch.sh 2>&1",
+    "echo; echo '## meta.json'", f"head -c 3000 {LEPTON}/{PACKAGE}/meta.json 2>&1",
+    "echo; echo '## lepton install'", "find / \\( -path /proc -o -path /sys -o -path /dev -o -path /home \\) -prune "
+    "-o -maxdepth 5 -iname '*lepton*' -print 2>/dev/null | head -20",
+    "find $HOME -maxdepth 7 -iname '*lepton*' 2>/dev/null | head -30",
+    "echo '## echo data, deeper'", "find $HOME -maxdepth 16 \\( -name com.readyatdawn.r15 -o -name _data \\) "
+    f"2>/dev/null | grep -vx \"{LEPTON}/{PACKAGE}\" | head -20",
+    "echo '## disk images'", "find $HOME /var -maxdepth 10 \\( -name '*.img' -o -name '*.qcow2' -o -name '*.erofs' "
+    "-o -name '*.sfs' \\) -size +50M 2>/dev/null | head -20",
     "echo '## journal'", "journalctl --user -n 3000 --no-pager 2>/dev/null | grep -E "
     "'EchoQuestXR|OpenXR|openxr|[Ll]epton|AndroidRuntime|readyatdawn' | grep -v RAD | tail -60",
 ])
@@ -204,7 +213,7 @@ def save_logs(adb, serial, path):
         first = out.strip().splitlines()[-1] if out.strip() else "no output"
         code, diag = run(adb, "-s", serial, "shell", PROBE, timeout=90)
         if "steamos" in diag.lower():   # Steam Frame: look into Lepton too
-            code, more = run(adb, "-s", serial, "shell", PROBE_STEAMOS, timeout=90)
+            code, more = run(adb, "-s", serial, "shell", PROBE_STEAMOS, timeout=300)
             diag += "\n" + more
         found = diag.split("## logcat binaries", 1)[-1].split("##", 1)[0].split()
         tried = []
