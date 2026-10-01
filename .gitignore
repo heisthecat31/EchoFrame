@@ -7,3 +7,9 @@ build/
 logger/stubs.S
 logger/names.h
 __pycache__/
+# signing keys the patcher generates -- private, never commit
+*.pem
+*.partial
+# logs of any kind (they can hold account details)
+*.log
+*.dmp

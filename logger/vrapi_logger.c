@@ -111,7 +111,7 @@ static int SafeCopy(void* dst, const void* src, size_t n) {
 }
 
 static void Hex(const char* what, const void* p, int n) {
-    uint8_t b[160];
+    uint8_t b[400];
     if (n > (int)sizeof(b)) n = sizeof(b);
     if (!SafeCopy(b, p, n)) { LOG("    %s: unreadable (%p)", what, p); return; }
     char line[3 * 96 + 1];
@@ -156,7 +156,14 @@ void* __vrlog_enter(uint32_t idx, VrFrame* f) {
         if (Is(idx, "vrapi_Initialize")) Hex("ovrInitParms", a0, 96);
         else if (Is(idx, "vrapi_EnterVrMode")) Hex("ovrModeParms", a0, 128);
         else if (Is(idx, "vrapi_CreateSystemVulkan")) Hex("ovrSystemCreateInfoVulkan", a0, 32);
-        else if (StartsWith(idx, "vrapi_SubmitFrame")) Hex("submit desc", a1, 96);
+        else if (StartsWith(idx, "vrapi_SubmitFrame")) {
+            Hex("submit desc", a1, 96);
+            // the first layer: desc+0x28 -> array of layer pointers -> layer
+            const void* layers = NULL;
+            const void* layer0 = NULL;
+            if (SafeCopy(&layers, (const char*)a1 + 0x28, sizeof(layers)) && SafeCopy(&layer0, layers, sizeof(layer0)))
+                Hex("layer 0", layer0, 336);
+        }
     }
     Summary();
     return g_real[idx] ? g_real[idx] : (void*)Missing;
@@ -233,7 +240,7 @@ void __vrlog_exit(uint32_t idx, VrFrame* f) {
         for (int i = 0; a2 && i < n && i < 24; ++i) w += snprintf(line + w, sizeof(line) - w, "%g ", ((const float*)a2)[i]);
         LOG("     property %llu = [%d] %s", (unsigned long long)f->x[1], n, w ? line : "");
     } else if (StartsWith(idx, "vrapi_GetPredictedTracking")) {
-        Hex("tracking (returned)", (const void*)f->x8, 160);
+        Hex("tracking (returned)", (const void*)f->x8, 360);
     } else if (Is(idx, "vrapi_GetInputTrackingState")) {
         // (ovr, deviceID, double time, ovrTracking* out): the double is in d0, so out is x2
         Hex("input tracking", a2, 96);
