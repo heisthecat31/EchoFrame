@@ -2,9 +2,12 @@
 
     python patch.py <echo.apk> [-o <out.apk>]      (or use gui.pyw)
 
-The same two changes runtime/build.py makes:
+The changes (changes() below; runtime/build.py makes the same ones):
   lib/arm64-v8a/libvrapi.so         replaced by the EchoQuestXR runtime (VrApi on OpenXR)
   lib/arm64-v8a/libopenxr_loader.so added (the Khronos OpenXR loader)
+  AndroidManifest.xml               Echo's activity becomes a LAUNCHER entry (Lepton on
+                                    Steam Frame needs it) and the OpenXR permissions are
+                                    declared (axml.py)
 Everything else in the APK is copied unchanged.
 
 The result is signed with a NEW random key every time (RSA-2048, self-signed), so no two
@@ -29,6 +32,9 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.serialization import pkcs7
 from cryptography.x509.oid import NameOID
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import axml  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LIB = "lib/arm64-v8a/"
@@ -131,12 +137,23 @@ def _aligned(zout, info, data, align):
     zout.writestr(info, data)
 
 
+def changes(apk, runtime, log=print):
+    """{entry name: new bytes}: every change EchoQuestXR makes to an Echo VR APK."""
+    out = {LIB + f: open(os.path.join(runtime, f), "rb").read() for f in RUNTIME_FILES}
+    with zipfile.ZipFile(apk) as z:
+        out["AndroidManifest.xml"] = axml.patch_manifest(z.read("AndroidManifest.xml"), log)
+    return out
+
+
 def patch(apk, out, log=print):
     log(f"Reading {apk}")
     log(f"  {inspect(apk)}")
     runtime = find_runtime()
     log(f"Runtime: {runtime}")
-    replace = {LIB + f: open(os.path.join(runtime, f), "rb").read() for f in RUNTIME_FILES}
+    try:
+        replace = changes(apk, runtime, log)
+    except axml.AxmlError as e:
+        raise PatchError(f"Couldn't update AndroidManifest.xml: {e}")
 
     entries = []   # (ZipInfo, data), signature files dropped
     with zipfile.ZipFile(apk) as zin:

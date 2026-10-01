@@ -7,7 +7,8 @@
    OpenXR SDK source with CMake (OPENXR_SDK, default: EchoXR's xr/OpenXR-SDK checkout).
 2. unimplemented.c: a stub for each VrApi export the runtime doesn't implement.
 3. NDK clang -> build/libvrapi.so (exports exactly VrApi's 114 functions).
-4. APK: lib/arm64-v8a/libvrapi.so replaced, libopenxr_loader.so added, re-signed.
+4. APK: the patcher's changes (patcher/patch.py changes(): libvrapi.so replaced,
+   libopenxr_loader.so added, manifest made Lepton-ready), signed with your key.
    Start from an APK without the logger (Meta's libvrapi.so in place).
 """
 import argparse
@@ -100,8 +101,10 @@ def main():
         if apkpack.LIB + "libvrapi_real.so" in z.namelist():
             sys.exit("this APK has the logger in it -- start from one with Meta's libvrapi.so")
     out = a.out or os.path.join(BUILD, os.path.splitext(os.path.basename(a.apk))[0] + "_openxr.apk")
-    apkpack.repack(a.apk, out, {apkpack.LIB + "libvrapi.so": open(lib, "rb").read(),
-                                apkpack.LIB + "libopenxr_loader.so": open(loader, "rb").read()}, a.ks, a.ks_pass, a.ks_type)
+    # exactly the patcher's changes (libraries + manifest), signed with your key instead
+    sys.path.insert(0, os.path.join(ROOT, "patcher"))
+    import patch  # noqa: E402
+    apkpack.repack(a.apk, out, patch.changes(a.apk, BUILD), a.ks, a.ks_pass, a.ks_type)
 
 
 if __name__ == "__main__":

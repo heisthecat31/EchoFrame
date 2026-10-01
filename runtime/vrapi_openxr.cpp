@@ -130,7 +130,8 @@ struct State {
     VkFence fence = VK_NULL_HANDLE;
 
     // extensions
-    bool hasTimespec = false, hasRefreshRate = false;
+    bool hasTimespec = false, hasRefreshRate = false, hasFrameController = false;
+    bool hasFdm = true;   // VK_EXT_fragment_density_map is in the device list Echo got
     PFN_xrGetVulkanInstanceExtensionsKHR getInstanceExts = nullptr;
     PFN_xrGetVulkanDeviceExtensionsKHR getDeviceExts = nullptr;
     PFN_xrGetVulkanGraphicsDeviceKHR getGraphicsDevice = nullptr;
@@ -354,16 +355,35 @@ void CreateInput() {
     g.aimPose = MakeAction("aim_pose", XR_ACTION_TYPE_POSE_INPUT);
     g.haptic = MakeAction("haptic", XR_ACTION_TYPE_VIBRATION_OUTPUT);
 
+    // One suggestion per controller type; the runtime picks whichever matches the
+    // controllers in use. A profile the runtime doesn't know is skipped.
     std::vector<XrActionSuggestedBinding> b;
     auto bind = [&](XrAction a, const char* left, const char* right) {
         if (left) b.push_back({ a, Path((std::string("/user/hand/left/") + left).c_str()) });
         if (right) b.push_back({ a, Path((std::string("/user/hand/right/") + right).c_str()) });
     };
-    bind(g.trigger, "input/trigger/value", "input/trigger/value");
+    auto common = [&]() {
+        bind(g.trigger, "input/trigger/value", "input/trigger/value");
+        bind(g.grip, "input/squeeze/value", "input/squeeze/value");
+        bind(g.stick, "input/thumbstick", "input/thumbstick");
+        bind(g.stickClick, "input/thumbstick/click", "input/thumbstick/click");
+        bind(g.gripPose, "input/grip/pose", "input/grip/pose");
+        bind(g.aimPose, "input/aim/pose", "input/aim/pose");
+        bind(g.haptic, "output/haptic", "output/haptic");
+    };
+    auto suggest = [&](const char* profile) {
+        XrInteractionProfileSuggestedBinding sb{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
+        sb.interactionProfile = Path(profile);
+        sb.countSuggestedBindings = (uint32_t)b.size();
+        sb.suggestedBindings = b.data();
+        XrResult r = xrSuggestInteractionProfileBindings(g.instance, &sb);
+        LOG("bindings for %s: %s", profile, XR_SUCCEEDED(r) ? "ok" : "not supported here");
+        b.clear();
+    };
+
+    // Meta Touch (Quest): what Echo was made for
+    common();
     bind(g.triggerTouch, "input/trigger/touch", "input/trigger/touch");
-    bind(g.grip, "input/squeeze/value", "input/squeeze/value");
-    bind(g.stick, "input/thumbstick", "input/thumbstick");
-    bind(g.stickClick, "input/thumbstick/click", "input/thumbstick/click");
     bind(g.stickTouch, "input/thumbstick/touch", "input/thumbstick/touch");
     bind(g.thumbrest, "input/thumbrest/touch", "input/thumbrest/touch");
     bind(g.primary, "input/x/click", "input/a/click");
@@ -371,14 +391,40 @@ void CreateInput() {
     bind(g.secondary, "input/y/click", "input/b/click");
     bind(g.secondaryTouch, "input/y/touch", "input/b/touch");
     bind(g.menu, "input/menu/click", nullptr);
+    suggest("/interaction_profiles/oculus/touch_controller");
+
+    // Steam Frame (XR_VALVE_frame_controller_interaction): the right hand has A/B/X/Y,
+    // the left a d-pad. Echo's left X/Y go to d-pad down/up (where X/Y sit on Touch),
+    // its menu to View.
+    if (g.hasFrameController) {
+        common();
+        bind(g.triggerTouch, "input/trigger/touch", "input/trigger/touch");
+        bind(g.stickTouch, "input/thumbstick/touch", "input/thumbstick/touch");
+        bind(g.primary, "input/dpad_down/click", "input/a/click");
+        bind(g.primaryTouch, "input/dpad_down/touch", "input/a/touch");
+        bind(g.secondary, "input/dpad_up/click", "input/b/click");
+        bind(g.secondaryTouch, "input/dpad_up/touch", "input/b/touch");
+        bind(g.menu, "input/view/click", nullptr);
+        suggest("/interaction_profiles/valve/frame_controller_valve");
+    }
+
+    // Valve Index: A/B on both hands
+    common();
+    bind(g.triggerTouch, "input/trigger/touch", "input/trigger/touch");
+    bind(g.stickTouch, "input/thumbstick/touch", "input/thumbstick/touch");
+    bind(g.primary, "input/a/click", "input/a/click");
+    bind(g.primaryTouch, "input/a/touch", "input/a/touch");
+    bind(g.secondary, "input/b/click", "input/b/click");
+    bind(g.secondaryTouch, "input/b/touch", "input/b/touch");
+    suggest("/interaction_profiles/valve/index_controller");
+
+    // anything else: trigger, menu and the poses
+    bind(g.trigger, "input/select/click", "input/select/click");
+    bind(g.menu, "input/menu/click", nullptr);
     bind(g.gripPose, "input/grip/pose", "input/grip/pose");
     bind(g.aimPose, "input/aim/pose", "input/aim/pose");
     bind(g.haptic, "output/haptic", "output/haptic");
-    XrInteractionProfileSuggestedBinding sb{XR_TYPE_INTERACTION_PROFILE_SUGGESTED_BINDING};
-    sb.interactionProfile = Path("/interaction_profiles/oculus/touch_controller");
-    sb.countSuggestedBindings = (uint32_t)b.size();
-    sb.suggestedBindings = b.data();
-    Ok(xrSuggestInteractionProfileBindings(g.instance, &sb), "xrSuggestInteractionProfileBindings");
+    suggest("/interaction_profiles/khr/simple_controller");
 
     XrSessionActionSetsAttachInfo ai{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
     ai.countActionSets = 1;
@@ -417,14 +463,58 @@ bool CreateSession() {
 }
 
 // "a b c" + "c d" -> "a b c d"
-std::string MergeExtensions(const char* vrapiList, const std::string& runtimeList) {
+// The extensions the Vulkan driver offers, without Echo's instance (it doesn't exist yet
+// when Echo asks): instance extensions directly, device ones through a throwaway instance
+// and the first GPU. Empty if it can't tell, which keeps every extension.
+std::set<std::string> SupportedVulkanExtensions(bool device) {
+    std::set<std::string> out;
+    std::vector<VkExtensionProperties> props;
+    uint32_t n = 0;
+    if (!device) {
+        if (vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr) == VK_SUCCESS && n) {
+            props.resize(n);
+            vkEnumerateInstanceExtensionProperties(nullptr, &n, props.data());
+        }
+    } else {
+        VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+        app.apiVersion = VK_API_VERSION_1_1;
+        VkInstanceCreateInfo ci{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+        ci.pApplicationInfo = &app;
+        VkInstance inst = VK_NULL_HANDLE;
+        if (vkCreateInstance(&ci, nullptr, &inst) == VK_SUCCESS) {
+            uint32_t gpus = 1;
+            VkPhysicalDevice gpu = VK_NULL_HANDLE;
+            VkResult r = vkEnumeratePhysicalDevices(inst, &gpus, &gpu);
+            if ((r == VK_SUCCESS || r == VK_INCOMPLETE) && gpu &&
+                vkEnumerateDeviceExtensionProperties(gpu, nullptr, &n, nullptr) == VK_SUCCESS && n) {
+                props.resize(n);
+                vkEnumerateDeviceExtensionProperties(gpu, nullptr, &n, props.data());
+            }
+            vkDestroyInstance(inst, nullptr);
+        }
+    }
+    for (const auto& p : props) out.insert(p.extensionName);
+    return out;
+}
+
+// What Echo got from VrApi plus what the OpenXR runtime needs. The runtime's are always
+// kept; VrApi's are kept only where the driver has them (a Vulkan device fails to create
+// with an extension the driver lacks, and Steam Frame's driver isn't Meta's).
+std::string MergeExtensions(const char* vrapiList, const std::string& runtimeList, bool device) {
+    std::set<std::string> supported = SupportedVulkanExtensions(device), seen;
     std::vector<std::string> out;
-    std::set<std::string> seen;
-    for (const std::string& list : { std::string(vrapiList), runtimeList }) {
-        std::istringstream in(list);
+    for (int pass = 0; pass < 2; ++pass) {
+        std::istringstream in(pass ? runtimeList : std::string(vrapiList));
         std::string e;
-        while (in >> e)
+        while (in >> e) {
+            if (!pass && !supported.empty() && !supported.count(e)) {
+                LOGE("Vulkan %s extension %s isn't supported by this driver: left out", device ? "device" : "instance", e.c_str());
+                if (e == "VK_EXT_fragment_density_map")
+                    LOGE("Echo renders with fragment density maps; without them it may draw nothing");
+                continue;
+            }
             if (seen.insert(e).second) out.push_back(e);
+        }
     }
     std::string s;
     for (const std::string& e : out) s += (s.empty() ? "" : " ") + e;
@@ -460,7 +550,7 @@ void CreateFoveationMaps(Swapchain* s) {
         ci.arrayLayers = (uint32_t)s->arraySize;
         ci.samples = VK_SAMPLE_COUNT_1_BIT;
         ci.tiling = VK_IMAGE_TILING_OPTIMAL;
-        ci.usage = VK_IMAGE_USAGE_FRAGMENT_DENSITY_MAP_BIT_EXT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        ci.usage = (g.hasFdm ? VK_IMAGE_USAGE_FRAGMENT_DENSITY_MAP_BIT_EXT : 0) | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         VkImage img = VK_NULL_HANDLE;
         VkDeviceMemory m = VK_NULL_HANDLE;
@@ -509,8 +599,12 @@ void FillFoveationMaps(Swapchain* s) {
         if (!img) continue;
         Barrier(img, (uint32_t)s->arraySize, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
         vkCmdClearColorImage(g.cmd, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &full, 1, &range);
-        Barrier(img, (uint32_t)s->arraySize, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT,
-                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_FRAGMENT_DENSITY_MAP_READ_BIT_EXT);
+        if (g.hasFdm)
+            Barrier(img, (uint32_t)s->arraySize, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_FRAGMENT_DENSITY_MAP_READ_BIT_EXT);
+        else
+            Barrier(img, (uint32_t)s->arraySize, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
     }
     vkEndCommandBuffer(g.cmd);
     SubmitAndWait();
@@ -759,6 +853,9 @@ EXPORT int32_t vrapi_Initialize(const vr::InitParms* p) {
     std::vector<const char*> exts = { XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME };
     if ((g.hasTimespec = has(XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME))) exts.push_back(XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME);
     if ((g.hasRefreshRate = has(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME))) exts.push_back(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
+    if ((g.hasFrameController = has("XR_VALVE_frame_controller_interaction"))) exts.push_back("XR_VALVE_frame_controller_interaction");
+    LOG("OpenXR extensions: timespec %d, refresh rate %d, Steam Frame controllers %d",
+        g.hasTimespec, g.hasRefreshRate, g.hasFrameController);
     if (!has(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME)) { LOGE("runtime has no XR_KHR_vulkan_enable"); return -1; }
 
     XrInstanceCreateInfoAndroidKHR android{XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR};
@@ -896,7 +993,7 @@ EXPORT int32_t vrapi_GetInstanceExtensionsVulkan(char* names, uint32_t* size) {
         runtime.resize(strlen(runtime.c_str()));
     }
     std::string list = MergeExtensions("VK_KHR_surface VK_KHR_android_surface VK_KHR_external_memory_capabilities "
-                                       "VK_KHR_get_physical_device_properties2", runtime);
+                                       "VK_KHR_get_physical_device_properties2", runtime, false);
     LOG("Vulkan instance extensions: %s", list.c_str());
     return WriteExtensions(list, names, size);
 }
@@ -911,7 +1008,8 @@ EXPORT int32_t vrapi_GetDeviceExtensionsVulkan(char* names, uint32_t* size) {
     }
     std::string list = MergeExtensions("VK_KHR_swapchain VK_KHR_external_memory VK_KHR_get_memory_requirements2 "
                                        "VK_ANDROID_external_memory_android_hardware_buffer VK_EXT_queue_family_foreign "
-                                       "VK_EXT_fragment_density_map", runtime);   // Echo renders with density maps
+                                       "VK_EXT_fragment_density_map", runtime, true);   // Echo renders with density maps
+    g.hasFdm = list.find("VK_EXT_fragment_density_map") != std::string::npos;
     LOG("Vulkan device extensions: %s", list.c_str());
     return WriteExtensions(list, names, size);
 }
@@ -946,6 +1044,17 @@ EXPORT void* vrapi_CreateTextureSwapChain3(int32_t type, int64_t format, int32_t
                                            int32_t bufferCount) {
     if (!g.session) { LOGE("swapchain requested before the session exists"); return nullptr; }
     if (type != 0 && type != 2) { LOGE("swapchain type %d isn't supported", type); return nullptr; }
+    {   // Echo views the images in this exact format, so there's no substitute: say so clearly
+        uint32_t n = 0;
+        xrEnumerateSwapchainFormats(g.session, 0, &n, nullptr);
+        std::vector<int64_t> formats(n);
+        xrEnumerateSwapchainFormats(g.session, n, &n, formats.data());
+        if (std::find(formats.begin(), formats.end(), format) == formats.end()) {
+            std::string list;
+            for (int64_t f : formats) list += std::to_string(f) + " ";
+            LOGE("the runtime has no swapchain format %lld (Echo's); it offers: %s", (long long)format, list.c_str());
+        }
+    }
     auto* s = new Swapchain;
     XrSwapchainCreateInfo ci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
     ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;

@@ -32,8 +32,10 @@ pip install -r patcher/requirements.txt
 pythonw patcher/gui.pyw            # or: python patcher/patch.py <echo.apk>
 ```
 
-It makes exactly two changes: `lib/arm64-v8a/libvrapi.so` becomes the EchoQuestXR runtime,
-and `lib/arm64-v8a/libopenxr_loader.so` (the Khronos OpenXR loader) is added. The result is
+It makes three changes: `lib/arm64-v8a/libvrapi.so` becomes the EchoQuestXR runtime,
+`lib/arm64-v8a/libopenxr_loader.so` (the Khronos OpenXR loader) is added, and the manifest
+gets a `LAUNCHER` entry plus the OpenXR permissions (Lepton on Steam Frame needs the first;
+both are harmless on Quest). The result is
 signed with a **new random key every time** (saved next to it as `.signing-key.pem`; keep
 it private), so no two people share a signing key.
 
@@ -90,9 +92,23 @@ python logger/build.py --apk <your-echo.apk> --ks <keystore>
 
 Sign it with the key of the copy installed on the headset so it installs as an update.
 
+## Steam Frame
+
+Ready on the EchoQuestXR side, untested on a Frame:
+- Lepton packaging: `LAUNCHER` entry and OpenXR permissions in the manifest (`patcher/axml.py`);
+  OpenXR 1.0 only; refresh-rate requests are optional.
+- Vulkan: extensions the driver lacks are left out (logged), so device creation can't fail
+  on them. Echo needs `VK_EXT_fragment_density_map` to draw; without it, expect a black view.
+- Controllers: Steam Frame (`XR_VALVE_frame_controller_interaction`: right A/B as A/B, left
+  d-pad down/up as X/Y, View as menu), Valve Index and the generic simple controller, as
+  well as Touch.
+
+To try it: sideload the patched APK through Lepton (Frame Control does this), then read
+`adb logcat -s EchoQuestXR` from the Frame. The first lines list the OpenXR extensions,
+the Vulkan extensions left out, and any swapchain-format problem.
+
 ## Not done yet
 
-- Steam Frame: Lepton packaging (launcher entry, OpenXR 1.0, fixed refresh rate).
 - Hand-tracking devices aren't offered to Echo (it only reads the controllers).
 - Haptics follow VrApi's buffer format as best understood; untested in detail.
 - Echo's own log prints the EchoVRCE login URL with its password; that's the game, not
