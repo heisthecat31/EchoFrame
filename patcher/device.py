@@ -2,9 +2,8 @@
 over, start Echo, save logs.
 
 Works with any Android headset adb can see (Quest; Steam Frame's Android container where
-it exposes adb). Logs are filtered to EchoQuestXR's and the OpenXR runtime's own tags:
-Echo's RAD log is left out on purpose, because it prints the community-server login
-(including a password) in plain text.
+it exposes adb). Save logs keeps everything Echo's process logged (its own log included),
+the crash log, and the OpenXR runtime's lines.
 
 Game data comes from the same mirrors the Echo VR installer app uses
 (github.com/heisthecat31/EchoVR-Installer): _data.zip goes to Echo's own media folder,
@@ -275,18 +274,35 @@ def launch(adb, serial):
     return code == 0 and "Error" not in out and not not_found(out), out
 
 
+# Everything Echo's process logged (its own log included), the crash log, and the OpenXR
+# runtime's lines from other processes. Runs in an Android shell (Quest, or Lepton's container).
+LOG_SCRIPT = "; ".join([
+    f"P=$(pidof {PACKAGE})",
+    "if [ -n \"$P\" ]; then echo \"=== Echo VR (pid $P)\"; logcat -d -v time --pid=$P; "
+    "else echo '=== Echo VR is not running: the last 4000 lines of everything'; logcat -d -v time -t 4000; fi",
+    "echo '=== crash log'", "logcat -d -v time -b crash",
+    "echo '=== EchoQuestXR and OpenXR, all processes'", "logcat -d -v time " + " ".join(f"'{t}'" for t in LOG_TAGS),
+])
+
+
 def save_logs(adb, serial, path):
-    """Writes what's in the device log for EchoQuestXR and OpenXR (no RAD lines) to `path`.
-    If the headset's shell can't run logcat at all, writes what that shell is instead, so the
-    log says why. Returns the number of lines."""
-    code, out = tool(adb, serial, "logcat", "-d", "-v", "time", *LOG_TAGS, timeout=60)
-    if not_found(out):   # Steam Frame: adb is on SteamOS; Android runs in Echo's Lepton container
-        tags = " ".join(f"'{t}'" for t in LOG_TAGS)
-        code, got = run(adb, "-s", serial, "shell", f"podman exec {LEPTON_CONTAINER} logcat -d -v time {tags} 2>&1",
-                        timeout=60)
-        if code == 0 and got.strip() and not not_found(got) and "Error:" not in got:
-            out = "(logcat from Echo's Lepton container)\n" + got
-    if not_found(out):
+    """Writes Echo's log (everything its process logged), the crash log and the OpenXR lines to
+    `path`. If the headset's shell can't run logcat at all, writes what that shell is instead,
+    so the log says why. Returns the number of lines."""
+    script = f"PATH=$PATH:{SYS.rstrip('/')}; " + LOG_SCRIPT
+    code, has = shell(adb, serial, f"PATH=$PATH:{SYS.rstrip('/')}; command -v logcat", timeout=20)
+    android = "logcat" in has
+    if android:
+        code, out = shell(adb, serial, script, timeout=90)
+    else:
+        out = has.strip() or "logcat: not found"
+    if not android and frame_info(adb, serial):   # Steam Frame: Android runs in Echo's Lepton container
+        code, got = shell(adb, serial, f"podman exec {LEPTON_CONTAINER} sh -c {shlex.quote(script)} 2>&1", timeout=90)
+        if code == 0 and got.strip() and "no such container" not in got and "Error:" not in got[:200]:
+            out, android = "(logs from Echo's Lepton container)\n" + got, True
+        else:
+            out = f"(Echo's Lepton container isn't running: start Echo, then Save logs)\n{got}"
+    if not android:
         first = out.strip().splitlines()[-1] if out.strip() else "no output"
         code, diag = run(adb, "-s", serial, "shell", PROBE, timeout=90)
         if "steamos" in diag.lower():   # Steam Frame: look into Lepton too
@@ -304,7 +320,7 @@ def save_logs(adb, serial, path):
             out = ("logcat couldn't run through this adb connection (" + first + ").\n"
                    "It isn't Android's shell. What it is:\n\n" + diag +
                    ("\n## other logcats tried\n" + "\n".join(tried) if tried else ""))
-    lines = [l for l in out.splitlines() if "/RAD" not in l]
+    lines = out.splitlines()
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
     return len(lines)

@@ -52,8 +52,8 @@ Echo VR installer app) and copies it to Android/media/com.readyatdawn.r15/files 
 the headset, where Echo reads it, plus the installer's asset patches. A headset that
 already has game data is left as it is. Your config.json (login) is never touched.
 
-Logs: "Save logs" in the window (EchoQuestXR and OpenXR lines only; Echo's own log
-is left out because it prints the community-server password). adb (Google's
+Logs: "Save logs" in the window (everything Echo logged, the crash log and the
+OpenXR runtime's lines; on Steam Frame, Echo must be running). adb (Google's
 platform-tools) installs itself when the window opens.
 
 The patch changes three things in the APK: lib/arm64-v8a/libvrapi.so (VrApi on

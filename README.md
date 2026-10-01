@@ -49,8 +49,8 @@ address Frame Control shows:
   where Echo reads it, plus the installer's asset patches (sha256-checked). A headset that
   already has game data is left as it is (Echo updates it itself; the zip could be older),
   and `config.json` (the community-server login) is never touched.
-- **Launch**, and **Save logs** (EchoQuestXR's and the OpenXR runtime's lines only: Echo's own
-  log is left out because it prints the community-server password). If the headset's shell
+- **Launch**, and **Save logs** (everything Echo's process logged, its own log included, plus
+  the crash log and the OpenXR runtime's lines). If the headset's shell
   can't run `logcat`, the saved file says what that shell is instead.
 
 adb (Google's platform-tools) installs itself when the window opens, into
@@ -150,12 +150,13 @@ private folder exists.
 
 1. Install Lepton Development, and send the Frame build's APK with Frame Control once.
 2. Start Echo once from the Steam library (it closes without data).
-3. In the window: Connect... (Frame Control's address), Install, Launch, Save logs. The first lines list the OpenXR extensions,
-the Vulkan extensions left out, and any swapchain-format problem.
+3. In the window: Connect... (Frame Control's address), Install, Launch, Save logs. The
+   log's EchoQuestXR lines list the OpenXR extensions, the Vulkan extensions left out, and
+   any swapchain-format problem.
 
 ## Not done yet
 
 - Hand-tracking devices aren't offered to Echo (it only reads the controllers).
 - Haptics follow VrApi's buffer format as best understood; untested in detail.
-- Echo's own log prints the EchoVRCE login URL with its password; that's the game, not
-  EchoQuestXR, but anyone with adb access to the headset can read it.
+- Some community builds of Echo print the EchoVRCE login (with its password) in Echo's own
+  log, which Save logs keeps: check a log before sharing it if yours does.
