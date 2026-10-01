@@ -131,6 +131,25 @@ PROBE = "; ".join([
     "lxc|r15|crun|bwrap' | head -30",
 ])
 
+# Steam Frame: adb lands on SteamOS, and Lepton keeps each Android app's storage under
+# ~/Applications/Android/<package>. Where Echo's storage and Android's log are. Read-only;
+# journal lines are limited to EchoQuestXR/OpenXR/Lepton and never Echo's RAD log.
+LEPTON = f"$HOME/Applications/Android"
+PROBE_STEAMOS = "; ".join([
+    "echo '## lepton apps'", f"ls -la {LEPTON} 2>&1 | head -20",
+    "echo '## echo storage'", f"find {LEPTON}/{PACKAGE} -maxdepth 6 2>&1 | head -80",
+    f"du -s {LEPTON}/{PACKAGE} 2>&1",
+    f"find {LEPTON}/{PACKAGE} -maxdepth 6 -type d \\( -name media -o -name Android -o -name files "
+    "-o -name sdcard -o -name emulated \\) 2>/dev/null | head -20",
+    "echo '## containers'", "podman ps -a --format '{{.ID}} {{.Image}} {{.Names}} {{.Status}}' 2>&1 | head -10",
+    "echo '## android-related processes'", "ps -eo pid,user,args 2>/dev/null | grep -iE "
+    "'android|lepton|r15|binder|bwrap|crun|conmon|podman|zygote|logd' | grep -v grep | cut -c1-200 | head -30",
+    "echo '## log files'", "find $HOME /tmp /run/user/$(id -u) /var/log -maxdepth 6 \\( -iname '*lepton*' "
+    "-o -iname '*logcat*' -o -iname '*android*.log' \\) 2>/dev/null | head -30",
+    "echo '## journal'", "journalctl --user -n 3000 --no-pager 2>/dev/null | grep -E "
+    "'EchoQuestXR|OpenXR|openxr|[Ll]epton|AndroidRuntime|readyatdawn' | grep -v RAD | tail -60",
+])
+
 
 def tool(adb, serial, name, *args, timeout=60):
     """Runs an Android tool (pm, am, logcat...) on the headset, by full path if the shell's
@@ -184,6 +203,9 @@ def save_logs(adb, serial, path):
     if not_found(out):
         first = out.strip().splitlines()[-1] if out.strip() else "no output"
         code, diag = run(adb, "-s", serial, "shell", PROBE, timeout=90)
+        if "steamos" in diag.lower():   # Steam Frame: look into Lepton too
+            code, more = run(adb, "-s", serial, "shell", PROBE_STEAMOS, timeout=90)
+            diag += "\n" + more
         found = diag.split("## logcat binaries", 1)[-1].split("##", 1)[0].split()
         tried = []
         for exe in (f for f in found if f.startswith("/")):   # a logcat elsewhere (inside a container)
