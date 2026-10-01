@@ -16,7 +16,7 @@ This repository ships **no game or Meta files**. You supply your own Echo VR APK
 | Step | State |
 | --- | --- |
 | 1. VrApi logger: record every call Echo makes on a Quest 3 | ✅ done, see [docs/vrapi-calls.md](docs/vrapi-calls.md) |
-| 2. Log the button layout (press each button once) | next |
+| 2. Log the button layout (press each button once) | ✅ done, same document |
 | 3. `libvrapi.so` on OpenXR, tested on Quest 3's own OpenXR runtime | not started |
 | 4. Package for Lepton and test on Steam Frame | not started |
 

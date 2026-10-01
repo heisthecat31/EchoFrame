@@ -74,9 +74,57 @@ Counts per frame, from the 5-second summaries (360 frames per 5 s):
 | 2 | `0x80` (hand) | `0x20000007` | tracking only |
 | 3 | `0x80` (hand) | `0x20000008` | tracking only |
 
-The button layout inside the input state isn't known yet. The logged frames are from
-startup, with nothing pressed. Next run: log the state whenever it changes and press
-each button once.
+### Touch input state (`vrapi_GetCurrentInputState`, 72 bytes)
+
+Mapped on 2026-10-01 by logging every change while pressing each control (run 3, ~80 s).
+The bit values agree with the button and touch flags in Meta's public VrApi SDK.
+
+| Offset | Type | Field | Notes |
+| --- | --- | --- | --- |
+| `+00` | u32 | controller type | 4 (Touch) |
+| `+08` | double | timestamp | seconds |
+| `+10` | u32 | **buttons** | bits below |
+| `+14` | u32 | trackpad status | toggles 0/1 now and then; Touch has no trackpad |
+| `+18` | float ×2 | thumbstick x, y (copy) | same values as `+34` |
+| `+20` | u8, u8 | battery %, recenter count | 80 %; the count went up by one on recentre |
+| `+24` | float | **index trigger** 0–1 | |
+| `+28` | float | **grip** 0–1 | |
+| `+2c` | u32 | **touches** | bits below |
+| `+34` | float ×2 | **thumbstick x, y** | |
+| `+3c` | float ×2 | thumbstick x, y without dead zone | |
+
+Buttons (`+10`):
+
+| Bit | Left | Right |
+| --- | --- | --- |
+| `0x00000001` | | A |
+| `0x00000002` | | B |
+| `0x00000004` | | stick click |
+| `0x00000100` | X | |
+| `0x00000200` | Y | |
+| `0x00000400` | stick click | |
+| `0x00002000` | thumb rest *(likely; always with touch `0x1000`)* | |
+| `0x04000000` | grip (with `+28`) | grip |
+| `0x20000000` | trigger (with `+24`) | trigger |
+| `0x80000000` | stick click (set with `0x400` / `0x4`) | stick click |
+
+Touches (`+2c`):
+
+| Bit | Meaning |
+| --- | --- |
+| `0x001` / `0x002` | thumb on A / B |
+| `0x004` / `0x008` | thumb on X / Y |
+| `0x020` | thumb on the stick (with `0x400` left, `0x800` right) |
+| `0x040` | finger on the trigger |
+| `0x100` | thumb up (thumb not touching anything) |
+| `0x200` | index pointing (finger off the trigger) |
+| `0x1000` | thumb rest *(likely)* |
+
+At rest the touches are `0x300` (thumb up, index pointing). **These touch bits are what
+Echo poses the fingers from**, so the OpenXR version fills them from the runtime's touch
+or finger-tracking inputs.
+
+Not seen: the menu button (it may go to Horizon OS, not the game) and d-pad bits.
 
 ## Events
 

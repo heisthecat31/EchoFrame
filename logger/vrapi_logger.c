@@ -16,6 +16,7 @@
 #define _GNU_SOURCE
 #include <android/log.h>
 #include <dlfcn.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stddef.h>
@@ -161,7 +162,44 @@ void* __vrlog_enter(uint32_t idx, VrFrame* f) {
     return g_real[idx] ? g_real[idx] : (void*)Missing;
 }
 
+// Button mapping: logs a controller's input state whenever it changes, showing only the
+// 4-byte words that changed (as hex and as a float). The two controllers' states sit 72
+// bytes apart in Echo's memory, so 72 bytes cover the whole struct; bytes 8-15 are the
+// timestamp and skipped. Analog changes under 0.05 are ignored, so resting jitter is quiet.
+#define INPUT_BYTES 72
+static int LooksFloat(uint32_t w) {
+    float v;
+    memcpy(&v, &w, 4);
+    return w == 0 || (v > -2.f && v < 2.f && (v > 1e-4f || v < -1e-4f));
+}
+static void InputChanged(const VrFrame* f) {
+    static uint8_t last[2][INPUT_BYTES];
+    static int have[2];
+    int side = f->x[1] == 0x20000002 ? 0 : f->x[1] == 0x20000003 ? 1 : -1;
+    uint8_t now[INPUT_BYTES];
+    if (side < 0 || (int)f->r[0] != 0 || !SafeCopy(now, (const void*)f->x[2], sizeof(now))) return;
+    if (!have[side]) { memcpy(last[side], now, sizeof(now)); have[side] = 1; Hex(side ? "R input (first)" : "L input (first)", now, INPUT_BYTES); return; }
+    char line[700];
+    int w = 0;
+    for (int off = 0; off < INPUT_BYTES; off += 4) {
+        if (off == 8 || off == 12) continue;   // timestamp
+        uint32_t a, b;
+        memcpy(&a, last[side] + off, 4);
+        memcpy(&b, now + off, 4);
+        if (a == b) continue;
+        float fa, fb;
+        memcpy(&fa, &a, 4);
+        memcpy(&fb, &b, 4);
+        if (LooksFloat(a) && LooksFloat(b) && fabsf(fb - fa) < 0.05f) continue;   // analog jitter
+        w += snprintf(line + w, sizeof(line) - w, " +%02x %08x->%08x (%.2f)", off, a, b, fb);
+        memcpy(last[side] + off, now + off, 4);
+        if (w > (int)sizeof(line) - 60) break;
+    }
+    if (w) LOG("[%.3f] %s input:%s", Now() - g_start, side ? "R" : "L", line);
+}
+
 void __vrlog_exit(uint32_t idx, VrFrame* f) {
+    if (Is(idx, "vrapi_GetCurrentInputState")) InputChanged(f);
     const void* a0 = (const void*)f->x[0];
     const void* a1 = (const void*)f->x[1];
     const void* a2 = (const void*)f->x[2];
