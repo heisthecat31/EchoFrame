@@ -42,7 +42,10 @@ untested so far, on Steam Frame and other OpenXR headsets.
      Steam library.
 
 Logs: "Save logs" in the window (EchoQuestXR and OpenXR lines only; Echo's own log
-is left out because it prints the community-server password).
+is left out because it prints the community-server password). The headset buttons
+install adb (Google's platform-tools) by themselves the first time, after asking.
+Steam Frame: launch Echo on the Frame, press Connect... and enter the adb address
+Frame Control shows for Echo (IP:port), then Save logs.
 
 The patch changes three things in the APK: lib/arm64-v8a/libvrapi.so (VrApi on
 OpenXR), lib/arm64-v8a/libopenxr_loader.so (Khronos OpenXR loader) and the manifest

@@ -13,7 +13,7 @@ import sys
 import threading
 import tkinter as tk
 import time
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, simpledialog
 
 import device
 import patch
@@ -229,9 +229,9 @@ class App(tk.Tk):
         self.text(52, y + 14, "3   HEADSET", "label", FAINT)
         dev = self.devs[0] if self.devs else None
         if not self.adb:
-            line, tint = "adb (Android platform-tools) isn't installed", WARN
+            line, tint = "Quest: plug in by USB and allow USB debugging. Steam Frame: Connect... (adb installs itself)", MUTED
         elif not dev:
-            line, tint = "No headset: connect it by USB and allow USB debugging", MUTED
+            line, tint = "No headset. Quest: plug in by USB and allow USB debugging. Steam Frame: Connect...", MUTED
         elif dev[2] != "device":
             line, tint = f"{dev[1]}: {dev[2]} (accept the USB debugging prompt in the headset)", WARN
         else:
@@ -241,8 +241,11 @@ class App(tk.Tk):
         if self.dev_msg:
             self.text(52, y + 64, self.dev_msg, "small", self.dev_tint, width=W - 400)
         ready = bool(dev and dev[2] == "device") and not self.dev_busy
-        if not self.adb:
-            self.button(W - 52 - 120, y + 30, 120, 38, "Get adb", "getadb", enabled=not self.dev_busy)
+        if not self.adb:   # the buttons install adb first (needs it to see any headset)
+            self.button(W - 52 - 252, y + 30, 140, 38, "Connect...", "connect", enabled=not self.dev_busy)
+            self.button(W - 52 - 104, y + 30, 104, 38, "Find USB", "getadb", enabled=not self.dev_busy)
+        elif not dev:   # nothing over USB: offer adb over the network (Steam Frame)
+            self.button(W - 52 - 140, y + 30, 140, 38, "Connect...", "connect", enabled=not self.dev_busy)
         else:
             self.button(W - 52 - 312, y + 30, 100, 38, "Install", "install", enabled=ready and bool(self.installable()))
             self.button(W - 52 - 204, y + 30, 92, 38, "Launch", "launch", enabled=ready)
@@ -271,10 +274,19 @@ class App(tk.Tk):
             self.msgs.put(("devdone", me))   # only the latest job clears "busy"
         threading.Thread(target=run, daemon=True).start()
 
-    def job_getadb(self):
-        self.msgs.put(("devmsg", ("Downloading Android platform-tools from Google...", MUTED)))
-        device.download_adb(log=lambda m: None)
-        self.msgs.put(("devmsg", ("adb ready.", GOOD)))
+    def job_getadb(self, then=None):
+        self.msgs.put(("devmsg", ("Installing adb (Android platform-tools from Google)...", MUTED)))
+        adb = device.download_adb(log=lambda m: None)
+        self.msgs.put(("adb", adb))
+        self.msgs.put(("devmsg", ("adb installed.", GOOD)))
+        if then:
+            self.msgs.put(("then", then))   # carry on with what was clicked
+
+    def job_connect(self, target):
+        self.msgs.put(("devmsg", (f"Connecting to {target}...", MUTED)))
+        ok, out = device.connect(self.adb, target)
+        self.msgs.put(("devmsg", ("Connected. Launch Echo on the Frame, then Save logs." if ok else f"Couldn't connect: {out}",
+                                  GOOD if ok else BAD)))
 
     def job_install(self, serial, apk, allow_uninstall=False):
         self.msgs.put(("devmsg", (f"Installing {os.path.basename(apk)}... (about a minute)", MUTED)))
@@ -304,7 +316,7 @@ class App(tk.Tk):
     def item_tag(self, e):
         for item in reversed(self.cv.find_overlapping(e.x, e.y, e.x, e.y)):
             for t in self.cv.gettags(item):
-                if t in ("pick", "out", "go", "folder", "again", "details", "getadb", "install", "launch", "logs"):
+                if t in ("pick", "out", "go", "folder", "again", "details", "getadb", "connect", "install", "launch", "logs"):
                     return t
         return None
 
@@ -335,15 +347,26 @@ class App(tk.Tk):
             self.state, self.lines, self.details = "pick", [], False
         elif t == "details":
             self.details = not self.details
-        elif t in ("getadb", "install", "launch", "logs") and not self.dev_busy:
+        elif t in ("getadb", "connect", "install", "launch", "logs") and not self.dev_busy:
             self.headset_click(t)
         self.draw()
 
     def headset_click(self, t):
+        if not self.adb:   # every headset action needs adb: install it first, once
+            if messagebox.askyesno("EchoQuestXR", "This needs adb (Android platform-tools, about 7 MB), which "
+                                   "isn't installed. Download it from Google (dl.google.com) into "
+                                   f"{device.DATA} now?"):
+                self.dev_job(self.job_getadb, None if t == "getadb" else t)
+            return
         if t == "getadb":
-            if messagebox.askyesno("EchoQuestXR", "Download Android platform-tools (adb, about 7 MB) from Google "
-                                   f"(dl.google.com) into {device.DATA}?"):
-                self.dev_job(self.job_getadb)
+            return
+        if t == "connect":
+            target = simpledialog.askstring(
+                "EchoQuestXR", "Steam Frame: the adb address of Echo's app, shown by Frame Control.\n\n"
+                "Enter it as IP:port, e.g. 192.168.1.50:5555 (or localhost:5555 through an SSH tunnel).",
+                parent=self)
+            if target:
+                self.dev_job(self.job_connect, target)
             return
         serial = self.devs[0][0] if self.devs else None
         if not serial:
@@ -417,6 +440,10 @@ class App(tk.Tk):
                     self.adb, self.devs = v
             elif kind == "devmsg":
                 self.dev_msg, self.dev_tint = v
+            elif kind == "adb":
+                self.adb = v
+            elif kind == "then":
+                self.after(10, lambda t=v: self.headset_click(t))
             elif kind == "devdone":
                 if v == self.job_id:
                     self.dev_busy = False

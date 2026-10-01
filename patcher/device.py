@@ -73,6 +73,17 @@ def devices(adb):
     return found
 
 
+def connect(adb, target):
+    """adb over the network (Steam Frame's Lepton apps each have an adb port): 'host:port'.
+    Returns (ok, message)."""
+    target = target.strip()
+    if ":" not in target:
+        target += ":5555"
+    code, out = run(adb, "connect", target, timeout=20)
+    ok = "connected to" in out and "cannot" not in out and "failed" not in out
+    return ok, out.splitlines()[-1] if out else f"adb connect failed ({code})"
+
+
 def installed(adb, serial):
     code, out = run(adb, "-s", serial, "shell", "pm", "list", "packages", PACKAGE, timeout=20)
     return f"package:{PACKAGE}" in out.split()
