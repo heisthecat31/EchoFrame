@@ -114,7 +114,8 @@ def main():
          "--name", name, "--icon", ico, "--distpath", REL, "--workpath", os.path.join(work, "work"),
          "--specpath", work, "--paths", patcher,
          *[a for lib in libs for a in ("--add-data", f"{lib}{sep}runtime")],
-         "--add-data", f"{ico}{sep}.", *[a for px in (44, 55, 66, 88) for a in ("--add-data", f"{png[:-4]}-{px}.png{sep}.")], "--add-data", f"{version_file}{sep}.",
+         "--add-data", f"{ico}{sep}.", *[a for px in (44, 55, 66, 88) for a in ("--add-data", f"{png[:-4]}-{px}.png{sep}.")],
+         "--add-data", f"{png}{sep}.", "--add-data", f"{os.path.join(ROOT, 'patcher', 'art')}{sep}art", "--add-data", f"{version_file}{sep}.",
          "--hidden-import", "patch", "--hidden-import", "device", "--hidden-import", "axml", "--hidden-import", "buttons", "--hidden-import", "minidump", "--hidden-import", "frame_setup",
          os.path.join(patcher, "gui.pyw")])
     exe = os.path.join(REL, name + ".exe")

@@ -25,6 +25,9 @@ import device
 LEPTON_APP = 3056000
 LEPTON_BIN = "$HOME/.local/share/Steam/steamapps/common/Lepton/lepton"
 NAME = "Echo VR"
+ART = os.path.join(device.HERE, "art")   # tools/make_art.py; bundled with the patcher
+ART_FILES = ("capsule.jpg", "hero.jpg", "logo.png", "wide.jpg")
+ART_VERSION = "2"   # bump to give Frames that have older artwork the new one
 
 # Frame Control's frame/android/lepton-app.sh, unchanged (MIT, Copyright (c) 2026 saphid).
 LAUNCH_SH = r'''#!/bin/bash
@@ -188,6 +191,26 @@ if cmd == "add":   # NAME EXE START_DIR -> the shortcut's app id
     }})()"""))
 elif cmd == "has":   # APPID -> yes / no
     print("yes" if evaluate(f"!!appStore.GetAppOverviewByAppID({int(args[0])})") else "no")
+elif cmd == "art":   # APPID DIR: the library artwork in DIR, and its icon
+    appid, folder = int(args[0]), args[1]
+    images = []
+    for kind, name in ((0, "capsule.jpg"), (1, "hero.jpg"), (2, "logo.png"), (3, "wide.jpg")):
+        path = os.path.join(folder, name)
+        if os.path.isfile(path):
+            with open(path, "rb") as f:
+                images.append([kind, name.rsplit(".", 1)[1], base64.b64encode(f.read()).decode()])
+    icon = os.path.join(folder, "icon.png")
+    print(evaluate(f"""(async () => {{
+      const id = {appid};
+      if (typeof SteamClient.Apps.SetCustomArtworkForApp !== "function") return "no artwork API";
+      for (const [type, ext, data] of {json.dumps(images)}) {{
+        if (typeof SteamClient.Apps.ClearCustomArtworkForApp === "function")
+          try {{ await SteamClient.Apps.ClearCustomArtworkForApp(id, type); }} catch (e) {{}}
+        await SteamClient.Apps.SetCustomArtworkForApp(id, data, ext, type);
+      }}
+      if ({json.dumps(os.path.isfile(icon))}) SteamClient.Apps.SetShortcutIcon(id, {json.dumps(icon)});
+      return "ok";
+    }})()""", timeout=60))
 elif cmd == "continue-install":   # accepts Steam's install dialog (state 7), if it's showing
     print(evaluate("(() => { try { SteamClient.Installs.ContinueInstall(); return 'ok'; } "
                    "catch (e) { return String(e); } })()"))
@@ -222,6 +245,30 @@ def _steam(adb, serial, home, *args, timeout=60):
     code, out = device.shell(adb, serial, f"python3 '{script}' {quoted} 2>&1", timeout=timeout)
     lines = out.strip().splitlines()
     return lines[-1].strip() if lines else ""
+
+
+def apply_art(adb, serial, home, shortcut, app_dir, log=print):
+    """Echo VR's library artwork and icon on its Steam shortcut (once per ART_VERSION)."""
+    d = f"{app_dir}/art"
+    code, out = device.shell(adb, serial, f"cat '{d}/applied' 2>/dev/null")
+    if out.strip() == ART_VERSION:
+        return
+    files = [(os.path.join(ART, f), f) for f in ART_FILES] + [(os.path.join(device.HERE, "echoframe.png"), "icon.png")]
+    files = [(src, name) for src, name in files if os.path.isfile(src)]
+    if not files:
+        return
+    device.shell(adb, serial, f"mkdir -p '{d}'")
+    for src, name in files:
+        code, out = device.run(adb, "-s", serial, "push", src, f"{d}/{name}", timeout=120)
+        if code != 0:
+            log(f"Artwork: couldn't copy {name} to the Frame: {out.strip()[-160:]}")
+            return
+    reply = _steam(adb, serial, home, "art", str(shortcut), d, timeout=120)
+    if reply == "ok":
+        device.shell(adb, serial, f"echo {ART_VERSION} > '{d}/applied'")
+        log("Steam library artwork set")
+    else:
+        log(f"Steam library artwork not set: {reply[:160] or 'no answer'}")
 
 
 def lepton_installed(adb, serial):
@@ -291,6 +338,7 @@ def set_up(adb, serial, apk, say=lambda f, t: None, log=print):
         shortcut = int(reply)
         log(f"Steam shortcut {shortcut} added")
     device.shell(adb, serial, f"echo {shortcut} > '{d}/shortcut.id'")
+    apply_art(adb, serial, home, shortcut, d, log)
     meta = {"package": pkg, "label": NAME, "instance": iid, "shortcut": shortcut,
             "game_id": (shortcut << 32) | 0x02000000, "vr": True, "flatscreen": False,
             "installed": time.strftime("%Y-%m-%dT%H:%M:%S"), "source": "EchoQuestXR", "library_version": 2}

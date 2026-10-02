@@ -246,6 +246,11 @@ def install(adb, serial, apk, say=lambda f, t: None, log=print):
             return "error", str(e)
         return "ok", "Installed. Press Launch: it restarts Echo so Lepton uses the new APK."
     if fr:   # Steam Frame: Lepton runs ~/Applications/Android/<package>/app.apk; it rebuilds on change
+        import frame_setup
+        try:   # the library artwork, for Frames set up before it existed
+            frame_setup.apply_art(adb, serial, fr.home, fr.shortcut, fr.app_dir, log)
+        except Exception as e:
+            log(f"Steam library artwork not set: {e}")
         part = f"{fr.app_dir}/app.apk.part"
         code, out = run(adb, "-s", serial, "push", apk, part, timeout=900)
         if code == 0:

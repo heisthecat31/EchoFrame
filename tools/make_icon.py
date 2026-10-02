@@ -61,10 +61,14 @@ def disc(img, cx, cy, r):
     img.alpha_composite(layer, (int(cx - layer.width / 2), int(cy - layer.height / 2)))
 
 
-def draw():
+def draw(shape="tile"):
+    """The icon at S x S: on a rounded tile, or (shape="circle") a round badge."""
     img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
     tile = Image.new("L", (S, S), 0)
-    ImageDraw.Draw(tile).rounded_rectangle((24, 24, S - 24, S - 24), radius=230, fill=255)
+    if shape == "circle":
+        ImageDraw.Draw(tile).ellipse((8, 8, S - 8, S - 8), fill=255)
+    else:
+        ImageDraw.Draw(tile).rounded_rectangle((24, 24, S - 24, S - 24), radius=230, fill=255)
     img.paste(gradient(S, (0x4f, 0x7b, 0xff), (0xa0, 0x58, 0xff)), (0, 0), tile)
 
     # a soft light flare, top left
