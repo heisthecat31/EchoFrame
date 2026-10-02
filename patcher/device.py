@@ -238,7 +238,7 @@ def install(adb, serial, apk):
         if code == 0:
             code, out = shell(adb, serial, f"mv -f '{part}' '{fr.app_dir}/app.apk' && echo moved")
         if "moved" in out:
-            return "ok", "Installed: Lepton uses the new APK the next time Echo starts."
+            return "ok", "Installed. Press Launch: it restarts Echo so Lepton uses the new APK."
         return "error", out.strip().splitlines()[-1] if out.strip() else f"copy failed ({code})"
     code, out = run(adb, "-s", serial, "install", "-r", apk, timeout=600)
     if not_found(out):   # adb install couldn't run the package manager: copy, then pm by path
@@ -262,9 +262,15 @@ def uninstall(adb, serial):
 def launch(adb, serial):
     """Restarts Echo, with the device log cleared first so saved logs cover this run."""
     fr = frame_info(adb, serial)
-    if fr:   # Steam Frame: start Echo's Steam shortcut, as the library's Play button does
+    if fr:   # Steam Frame: restart Echo's Lepton instance, then start its Steam shortcut
         if not fr.shortcut:
             return False, "No Steam shortcut for Echo on this Frame: start it from the Steam library."
+        # Echo's process stays up after a start-up error, so its container (and Steam's
+        # "running") does too, and a new app.apk is only used by a fresh container
+        container = f"lepton-steamlaunch-{fr.instance}"
+        shell(adb, serial, f"podman stop -t 5 {container} >/dev/null 2>&1; "
+                           f"for i in 1 2 3 4 5 6 7 8 9 10; do podman container exists {container} || break; "
+                           "sleep 1; done", timeout=60)
         game = (int(fr.shortcut) << 32) | 0x02000000
         code, out = shell(adb, serial, f"nohup steam steam://rungameid/{game} >/dev/null 2>&1 & echo started")
         return "started" in out, out
