@@ -132,6 +132,8 @@ struct State {
     // extensions
     bool hasTimespec = false, hasRefreshRate = false, hasFrameController = false;
     bool hasFdm = true;   // VK_EXT_fragment_density_map is in the device list Echo got
+    std::set<std::string> driverDeviceExts;   // what the driver offers, probed before Echo's instance
+    bool probedDeviceExts = false;
     PFN_xrGetVulkanInstanceExtensionsKHR getInstanceExts = nullptr;
     PFN_xrGetVulkanDeviceExtensionsKHR getDeviceExts = nullptr;
     PFN_xrGetVulkanGraphicsDeviceKHR getGraphicsDevice = nullptr;
@@ -463,9 +465,14 @@ bool CreateSession() {
 }
 
 // "a b c" + "c d" -> "a b c d"
-// The extensions the Vulkan driver offers, without Echo's instance (it doesn't exist yet
-// when Echo asks): instance extensions directly, device ones through a throwaway instance
-// and the first GPU. Empty if it can't tell, which keeps every extension.
+// The extensions the Vulkan driver offers, without Echo's instance: instance extensions
+// directly, device ones through a throwaway instance and the first GPU. Empty if it can't
+// tell, which keeps every extension.
+// The throwaway instance is made once, when Echo asks for instance extensions, before its
+// own instance exists. On the Steam Frame, Lepton puts Valve's fdm_injection and fossilize
+// layers in every instance; one made and destroyed between Echo's vkCreateInstance and its
+// vkCreateDevice crashed Echo inside vkCreateDevice (SIGSEGV right after Fossilize's
+// "Overriding serialization path"). So device extensions asked for later use what was probed.
 std::set<std::string> SupportedVulkanExtensions(bool device) {
     std::set<std::string> out;
     std::vector<VkExtensionProperties> props;
@@ -475,6 +482,8 @@ std::set<std::string> SupportedVulkanExtensions(bool device) {
             props.resize(n);
             vkEnumerateInstanceExtensionProperties(nullptr, &n, props.data());
         }
+    } else if (g.probedDeviceExts) {
+        return g.driverDeviceExts;
     } else {
         VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
         app.apiVersion = VK_API_VERSION_1_1;
@@ -494,6 +503,10 @@ std::set<std::string> SupportedVulkanExtensions(bool device) {
         }
     }
     for (const auto& p : props) out.insert(p.extensionName);
+    if (device) {
+        g.driverDeviceExts = out;
+        g.probedDeviceExts = true;
+    }
     return out;
 }
 
@@ -985,6 +998,7 @@ EXPORT int32_t vrapi_SetDisplayRefreshRate(void*, float rate) {
 // Vulkan
 // ---------------------------------------------------------------------------
 EXPORT int32_t vrapi_GetInstanceExtensionsVulkan(char* names, uint32_t* size) {
+    if (!g.probedDeviceExts) SupportedVulkanExtensions(true);   // now, before Echo's instance exists
     std::string runtime;
     uint32_t n = 0;
     if (g.getInstanceExts && XR_SUCCEEDED(g.getInstanceExts(g.instance, g.system, 0, &n, nullptr)) && n) {

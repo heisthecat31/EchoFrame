@@ -153,7 +153,12 @@ instructions in Echo's `CGS::Initialize` for the Frame's Mesa driver
   didn't see ("Required extension ... does not exist"). Mesa lists far more, so the ones
   SteamVR needs (Android hardware buffers, foreign queue family) were left out and Echo
   crashed. The Frame build enables every extension the runtime asks for; the runtime only
-  asks for ones the driver has. Over the Frame's adb the
+  asks for ones the driver has.
+
+The runtime finds out which device extensions the driver has with a throwaway Vulkan
+instance, made before Echo's own: Lepton loads Valve's `fdm_injection` and `fossilize`
+layers into every instance, and one made and destroyed between Echo's instance and its
+device crashed Echo inside `vkCreateDevice`. Over the Frame's adb the
 window then: **Install** replaces `app.apk` and copies the game data into that private folder
 (through `podman unshare`, owned by Echo's user); **Launch** starts the Steam shortcut;
 **Save logs** runs `logcat` inside Echo's container. Echo has to have started once so its
