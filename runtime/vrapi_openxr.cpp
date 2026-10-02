@@ -18,27 +18,43 @@
 //
 // Logs to logcat under EchoQuestXR. Properties, read at startup:
 //   debug.echoquestxr.pose grip      controllers from the grip pose (default: aim, which matches VrApi)
-//   debug.echoquestxr.flip 0         don't flip images (VrApi's are bottom-up; default: flip)
+//   debug.echoquestxr.flip 0|fov|copy   VrApi's images are bottom-up. fov: flip them by
+//                                    submitting an upside-down field of view (default on Meta's
+//                                    runtime); copy: copy each frame upside down into a second
+//                                    swapchain (default elsewhere: SteamVR); 0: don't flip
 //   debug.echoquestxr.test red|probe|redprobe   display-path diagnostics
 #define XR_USE_PLATFORM_ANDROID
 #define XR_USE_GRAPHICS_API_VULKAN
 #define XR_USE_TIMESPEC
 #include <android/log.h>
+#include <dirent.h>
+#include <dlfcn.h>
 #include <jni.h>
+#include <link.h>
+#include <signal.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
 #include <sys/system_properties.h>
 #include <time.h>
+#include <ucontext.h>
 #include <unistd.h>
 #include <vulkan/vulkan.h>
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <deque>
+#include <map>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <string>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "vrapi_layouts.h"
@@ -65,6 +81,11 @@ struct Swapchain {
     int32_t acquired = -1;   // image index acquired this frame, -1 = none
     int32_t echoLast = -1;   // the image Echo rendered last frame (it goes round-robin)
     uint64_t mismatches = 0;
+    // flip by copy (g.flipCopy): what's submitted is this swapchain, Echo's image copied in
+    // upside down
+    XrSwapchain out = XR_NULL_HANDLE;
+    std::vector<XrSwapchainImageVulkanKHR> outImages;
+    int32_t outAcquired = -1;
 };
 
 struct ViewCache { double time = -1; XrView views[2]; };
@@ -104,7 +125,7 @@ struct State {
     double waitedTime = 0;         // its predicted display time, seconds
     double period = 1.0 / 72;
     uint64_t submitted = 0;        // frames ended, for once-per-frame input sync
-    ViewCache cache[16];
+    ViewCache cache[256];   // Echo asks ~3 times a frame, up to ~10 frames ahead on Steam Frame
     int cacheNext = 0;
 
     std::deque<int32_t> events;
@@ -118,9 +139,30 @@ struct State {
     uint64_t syncedFrame = ~0ull;
     bool useAimPose = false;
     bool flipY = true;   // VrApi images are bottom-up; debug.echoquestxr.flip=0 turns this off
+    // How: by an upside-down fov in the layer (Meta's compositor shows that right; on Steam
+    // Frame each eye saw a wrong picture and the world slid as the head turned), or by
+    // copying each frame upside down into a second swapchain (FlipCopy)
+    bool flipCopy = false;
+    VkCommandPool flipPool = VK_NULL_HANDLE;
+    VkCommandBuffer flipCmd[4] = {};
+    VkFence flipFence[4] = {};
+    int flipNext = 0;
+    // GPU time per frame (with the flip copy): timestamps when Echo's frame work starts on the
+    // GPU (a mark submitted at BeginFrame) and when it's done (at the start of the copy)
+    VkQueryPool gpuPool = VK_NULL_HANDLE;
+    VkCommandBuffer markCmd[8] = {};
+    VkFence markFence[8] = {};
+    double tsPeriod = 1.0;   // ns per timestamp tick
+    double gpuSum = 0;       // ms, since the last timing log
+    int gpuCount = 0;
 
     // debug.echoquestxr.test=red: paint every submitted image red (display-path test)
     bool testRed = false;
+    bool semaphoreGuard = false;   // see "semaphore guard"
+    bool useEchoFov = true;        // submit the fov Echo rendered with (debug.echoquestxr.fov openxr: OpenXR's)
+    int64_t clockOffset = 0;       // XrTime - CLOCK_MONOTONIC ns, when the runtime can't convert (CalibrateClock)
+    bool clockCalibrated = false;
+    double waitedAt = 0, timeInWait = 0, timeInFrame = 0, latency = 0, timingSince = 0;   // frame timing, logged every 720 frames
     // debug.echoquestxr.test=probe: read back a few pixels at release time and log them
     bool testProbe = false;
     VkBuffer probeBuf = VK_NULL_HANDLE;
@@ -174,13 +216,44 @@ XrTime ToXrTime(double seconds) {
     ts.tv_nsec = (long)((seconds - (double)ts.tv_sec) * 1e9);
     XrTime t = 0;
     if (g.timespecToTime && XR_SUCCEEDED(g.timespecToTime(g.instance, &ts, &t))) return t;
-    return (XrTime)(seconds * 1e9);   // Android runtimes use CLOCK_MONOTONIC nanoseconds
+    return (XrTime)(seconds * 1e9) + g.clockOffset;   // CLOCK_MONOTONIC ns, plus CalibrateClock's offset
 }
 
 double ToSeconds(XrTime t) {
     timespec ts;
     if (g.timeToTimespec && XR_SUCCEEDED(g.timeToTimespec(g.instance, t, &ts))) return ts.tv_sec + ts.tv_nsec * 1e-9;
-    return t * 1e-9;
+    return (t - g.clockOffset) * 1e-9;
+}
+
+int64_t ClockNs(clockid_t id) {
+    timespec ts;
+    clock_gettime(id, &ts);
+    return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+
+// Without XR_KHR_convert_timespec_time the runtime's XrTime is taken to be CLOCK_MONOTONIC
+// nanoseconds (as Android runtimes do). On Steam Frame SteamVR's predicted display times came
+// out ~0.3 s ahead of CLOCK_MONOTONIC: it counts from another clock. From the first frame's
+// predicted display time, pick the clock that puts it 0-150 ms ahead, and convert with it.
+void CalibrateClock(XrTime predicted) {
+    if (g.timespecToTime || g.clockCalibrated) return;
+    g.clockCalibrated = true;
+    struct { const char* name; clockid_t id; } clocks[] = {
+        { "CLOCK_MONOTONIC", CLOCK_MONOTONIC }, { "CLOCK_BOOTTIME", CLOCK_BOOTTIME },
+        { "CLOCK_MONOTONIC_RAW", CLOCK_MONOTONIC_RAW }, { "CLOCK_REALTIME", CLOCK_REALTIME },
+    };
+    int64_t mono = ClockNs(CLOCK_MONOTONIC);
+    std::string seen;
+    const char* chosen = nullptr;
+    for (auto& c : clocks) {
+        int64_t now = ClockNs(c.id), ahead = predicted - now;
+        char buf[96];
+        snprintf(buf, sizeof buf, " %s %+.1f ms;", c.name, ahead / 1e6);
+        seen += buf;
+        if (!chosen && ahead >= 0 && ahead <= 150000000) { chosen = c.name; g.clockOffset = now - mono; }
+    }
+    LOG("OpenXR clock: predicted display time is ahead of%s using %s (offset %+.1f ms from CLOCK_MONOTONIC)", seen.c_str(),
+        chosen ? chosen : "CLOCK_MONOTONIC (none fit)", g.clockOffset / 1e6);
 }
 
 // ---------------------------------------------------------------------------
@@ -203,6 +276,36 @@ vr::Matrix4f Projection(const XrFovf& fov) {
     m.M[2][3] = -2 * nearZ;
     m.M[3][2] = -1;
     return m;
+}
+
+// The field of view an eye image was rendered with, from its layer's TexCoordsFromTanAngles
+// (VrApi: texture coordinates = M * (tanX, tanY, -1), u and v 0-1 across the image, v up)
+// and the image's rect. False if the matrix isn't usable.
+bool FovFromTanAngles(const vr::Matrix4f& m, const float* rect, XrFovf& out) {
+    auto tanX = [&](float u) { return (m.M[0][2] - u * m.M[2][2]) / (m.M[0][0] - u * m.M[2][0]); };
+    auto tanY = [&](float v) { return (m.M[1][2] - v * m.M[2][2]) / (m.M[1][1] - v * m.M[2][1]); };
+    float x0 = tanX(rect[0]), x1 = tanX(rect[0] + rect[2]), y0 = tanY(rect[1]), y1 = tanY(rect[1] + rect[3]);
+    if (!std::isfinite(x0) || !std::isfinite(x1) || !std::isfinite(y0) || !std::isfinite(y1) || x0 == x1 || y0 == y1) return false;
+    out.angleLeft = std::atan(std::min(x0, x1));
+    out.angleRight = std::atan(std::max(x0, x1));
+    out.angleDown = std::atan(std::min(y0, y1));
+    out.angleUp = std::atan(std::max(y0, y1));
+    return out.angleLeft < 0 && out.angleRight > 0 && out.angleDown < 0 && out.angleUp > 0 &&
+           out.angleRight - out.angleLeft < 3.0f && out.angleUp - out.angleDown < 3.0f;
+}
+
+// the angle between two orientations, degrees (an eye view turned from the head: canted displays)
+float TurnDegrees(const vr::Quatf& a, const XrQuaternionf& b) {
+    float d = std::fabs(a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w);
+    return 2 * std::acos(std::min(1.0f, d)) * 57.29578f;
+}
+
+// a world-space offset in the head's own axes (rotated by the inverse of its orientation)
+vr::Vector3f InHeadAxes(const vr::Quatf& q, const vr::Vector3f& v) {
+    // v' = v + 2w(c x v) + 2 c x (c x v), with c = -(x, y, z) for the inverse rotation
+    float cx = -q.x, cy = -q.y, cz = -q.z;
+    float tx = 2 * (cy * v.z - cz * v.y), ty = 2 * (cz * v.x - cx * v.z), tz = 2 * (cx * v.y - cy * v.x);
+    return { v.x + q.w * tx + (cy * tz - cz * ty), v.y + q.w * ty + (cz * tx - cx * tz), v.z + q.w * tz + (cx * ty - cy * tx) };
 }
 
 // world-to-eye: inverse of the eye's pose
@@ -239,7 +342,10 @@ bool Locate(XrSpace space, double seconds, vr::RigidBodyPosef& out, uint32_t& st
     out.TimeInSeconds = seconds;
     out.PredictionInSeconds = std::max(0.0, seconds - Now());
     status = 0;
-    if (!g.session || space == XR_NULL_HANDLE) return false;
+    // Only once the session runs: Echo asks for poses in its first frames, before it enters
+    // VR mode, and on Steam Frame (SteamVR) the first locate call before xrBeginSession never
+    // returned, which hung Echo's main loop before it could take its window.
+    if (!g.running || space == XR_NULL_HANDLE) return false;
     XrSpaceVelocity vel{XR_TYPE_SPACE_VELOCITY};
     XrSpaceLocation loc{XR_TYPE_SPACE_LOCATION, &vel};
     if (XR_FAILED(xrLocateSpace(space, g.local, ToXrTime(seconds), &loc))) return false;
@@ -334,6 +440,69 @@ XrPath Path(const char* s) {
     return p;
 }
 
+// Steam Frame settings from the patcher's "Steam Frame buttons" section: echoquestxr-buttons.txt
+// in Echo's files folder, one "name=value" per line.
+//   X, Y, Menu   Echo's left-hand buttons: a left Frame input (dpad_up/down/left/right, view, bumper)
+//   A, B         its right-hand buttons: a right Frame input (a, b, x, y, menu, bumper)
+//                (none leaves Echo's button unbound)
+//   Refresh      the display refresh rate to ask for instead of Echo's 72, or "default" for
+//                SteamVR's own
+// Anything else in the file keeps the default. Read once.
+struct FrameSettingsData {
+    std::string x = "dpad_down", y = "dpad_up", menu = "view", a = "a", b = "b";
+    std::string refresh;   // "" = Echo's request
+    std::string foveation = "off";   // the foveation maps' pattern (FoveationLevel)
+};
+
+const FrameSettingsData& FrameSettings() {
+    static FrameSettingsData m;
+    static bool read = false;
+    if (read) return m;
+    read = true;
+    static const char* const left[] = { "dpad_up", "dpad_down", "dpad_left", "dpad_right", "view", "bumper", "none" };
+    static const char* const right[] = { "a", "b", "x", "y", "menu", "bumper", "none" };
+    std::string text;
+    for (const char* path : { "/data/data/com.readyatdawn.r15/files/echoquestxr-buttons.txt",
+                              "/sdcard/Android/media/com.readyatdawn.r15/files/echoquestxr-buttons.txt" })
+        if (FILE* f = fopen(path, "re")) {
+            char buf[512];
+            text.assign(buf, fread(buf, 1, sizeof buf - 1, f));
+            fclose(f);
+            break;
+        }
+    std::istringstream lines(text);
+    std::string line;
+    while (std::getline(lines, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string key = line.substr(0, eq), value = line.substr(eq + 1);
+        if (key == "Refresh") {
+            if (value == "default" || atof(value.c_str()) >= 30) m.refresh = value;
+            continue;
+        }
+        if (key == "Foveation") {
+            if (value == "off" || value == "low" || value == "medium" || value == "high") m.foveation = value;
+            continue;
+        }
+        if (key == "Sync" || key == "Mic") continue;   // applied by the patcher (launch.sh, SteamOS)
+        bool isLeft = key == "X" || key == "Y" || key == "Menu";
+        bool known = false;
+        for (const char* v : isLeft ? left : right) known = known || value == v;
+        if (!known) { LOGE("Steam Frame buttons: %s=%s isn't a %s-hand input; default kept", key.c_str(), value.c_str(), isLeft ? "left" : "right"); continue; }
+        if (value == "none") value.clear();
+        if (key == "X") m.x = value;
+        else if (key == "Y") m.y = value;
+        else if (key == "Menu") m.menu = value;
+        else if (key == "A") m.a = value;
+        else if (key == "B") m.b = value;
+    }
+    LOG("Steam Frame settings%s: X=%s Y=%s Menu=%s A=%s B=%s refresh=%s", text.empty() ? " (default)" : "", m.x.c_str(),
+        m.y.c_str(), m.menu.c_str(), m.a.c_str(), m.b.c_str(), m.refresh.empty() ? "Echo's" : m.refresh.c_str());
+    LOG("Steam Frame settings: foveation %s", m.foveation.c_str());
+    return m;
+}
+
 void CreateInput() {
     g.hands[0].path = Path("/user/hand/left");
     g.hands[1].path = Path("/user/hand/right");
@@ -395,18 +564,22 @@ void CreateInput() {
     bind(g.menu, "input/menu/click", nullptr);
     suggest("/interaction_profiles/oculus/touch_controller");
 
-    // Steam Frame (XR_VALVE_frame_controller_interaction): the right hand has A/B/X/Y,
-    // the left a d-pad. Echo's left X/Y go to d-pad down/up (where X/Y sit on Touch),
-    // its menu to View.
+    // Steam Frame (XR_VALVE_frame_controller_interaction): the right hand has A/B/X/Y and
+    // Menu, the left a d-pad and View, both a bumper. Which Frame button is which of Echo's
+    // comes from FrameSettings() (the patcher's "Steam Frame buttons"); by default Echo's left
+    // X/Y are d-pad down/up (where X/Y sit on Touch), its menu View, A/B are A/B.
     if (g.hasFrameController) {
+        const FrameSettingsData& m = FrameSettings();
+        auto click = [](const std::string& in) { return "input/" + in + "/click"; };
+        auto touch = [](const std::string& in) { return "input/" + in + "/touch"; };
         common();
         bind(g.triggerTouch, "input/trigger/touch", "input/trigger/touch");
         bind(g.stickTouch, "input/thumbstick/touch", "input/thumbstick/touch");
-        bind(g.primary, "input/dpad_down/click", "input/a/click");
-        bind(g.primaryTouch, "input/dpad_down/touch", "input/a/touch");
-        bind(g.secondary, "input/dpad_up/click", "input/b/click");
-        bind(g.secondaryTouch, "input/dpad_up/touch", "input/b/touch");
-        bind(g.menu, "input/view/click", nullptr);
+        bind(g.primary, m.x.empty() ? nullptr : click(m.x).c_str(), m.a.empty() ? nullptr : click(m.a).c_str());
+        bind(g.primaryTouch, m.x.empty() ? nullptr : touch(m.x).c_str(), m.a.empty() ? nullptr : touch(m.a).c_str());
+        bind(g.secondary, m.y.empty() ? nullptr : click(m.y).c_str(), m.b.empty() ? nullptr : click(m.b).c_str());
+        bind(g.secondaryTouch, m.y.empty() ? nullptr : touch(m.y).c_str(), m.b.empty() ? nullptr : touch(m.b).c_str());
+        if (!m.menu.empty()) bind(g.menu, click(m.menu).c_str(), nullptr);
         suggest("/interaction_profiles/valve/frame_controller_valve");
     }
 
@@ -473,6 +646,8 @@ bool CreateSession() {
 // layers in every instance; one made and destroyed between Echo's vkCreateInstance and its
 // vkCreateDevice crashed Echo inside vkCreateDevice (SIGSEGV right after Fossilize's
 // "Overriding serialization path"). So device extensions asked for later use what was probed.
+void ProbeProcAddrs(VkInstance instance);   // (with the Vulkan hooks, below)
+
 std::set<std::string> SupportedVulkanExtensions(bool device) {
     std::set<std::string> out;
     std::vector<VkExtensionProperties> props;
@@ -499,6 +674,7 @@ std::set<std::string> SupportedVulkanExtensions(bool device) {
                 props.resize(n);
                 vkEnumerateDeviceExtensionProperties(gpu, nullptr, &n, props.data());
             }
+            ProbeProcAddrs(inst);
             vkDestroyInstance(inst, nullptr);
         }
     }
@@ -547,8 +723,10 @@ int32_t WriteExtensions(const std::string& list, char* names, uint32_t* size) {
 
 // One foveation map per swapchain image: R8G8_UNORM (the format Echo views it as), a
 // 2-layer array like the eye buffers, one texel per 16x16 pixels (the Quest 3's density
-// texel size). Echo only needs a valid image to make its view; nothing reads it yet.
+// texel size). Echo renders every frame with it as its fragment density map: what VrApi's
+// fixed foveation was on Quest. FillFoveationMaps writes the pattern (FoveationLevel).
 void FillFoveationMaps(Swapchain* s);
+std::string FoveationLevel();
 void CreateFoveationMaps(Swapchain* s) {
     s->fdmWidth = (uint32_t)(s->width + 15) / 16;
     s->fdmHeight = (uint32_t)(s->height + 15) / 16;
@@ -591,15 +769,98 @@ void CreateFoveationMaps(Swapchain* s) {
         s->fdmMemory.push_back(m);
     }
     FillFoveationMaps(s);
-    LOG("foveation maps: %zu x %ux%u x%d, full density", s->fdm.size(), s->fdmWidth, s->fdmHeight, s->arraySize);
+    LOG("foveation maps: %zu x %ux%u x%d, %s", s->fdm.size(), s->fdmWidth, s->fdmHeight, s->arraySize,
+        FoveationLevel().c_str());
 }
 
 void EnsureCommands();
 void SubmitAndWait();
 void Barrier(VkImage img, uint32_t layers, VkImageLayout from, VkImageLayout to, VkAccessFlags src, VkAccessFlags dst);
 
-// 255 = full resolution everywhere, the same as foveation level 0
+// Fixed foveation, as Quest's: full density around each eye's optical centre, half and then a
+// quarter towards the edges (turnip steps densities to 1, 1/2, 1/4). Rings are ellipses in
+// tangent space (fraction of the half-field), centred where the eye looks straight ahead: the
+// Frame's views are off-centre (fov -0.95/0.88 left/right, 0.80/-1.04 up/down for the left
+// eye). Echo's rows run bottom-up, so row 0 is the bottom of the view. Level: the patcher's
+// Steam Frame "Foveation=" (default off), or debug.echoquestxr.foveation; Quest: off.
+std::string FoveationLevel() {
+    static std::string level = [] {
+        char prop[PROP_VALUE_MAX] = "";
+        __system_property_get("debug.echoquestxr.foveation", prop);
+        if (prop[0]) return std::string(prop);
+        return g.flipCopy ? FrameSettings().foveation : std::string("off");   // flip copy: not Meta's runtime
+    }();
+    return level;
+}
+
+// density (0..255) for one texel at (u, v) in [0, 1], with the view's centre at (cu, cv)
+uint8_t FoveationDensity(float u, float v, float cu, float cv, float inner, float outer) {
+    float dx = (u - cu) / (u < cu ? cu : 1 - cu), dy = (v - cv) / (v < cv ? cv : 1 - cv);   // -1..1 to the edge
+    float r = std::sqrt(dx * dx + dy * dy);
+    return r < inner ? 255 : r < outer ? 128 : 64;
+}
+
 void FillFoveationMaps(Swapchain* s) {
+    std::string level = FoveationLevel();
+    float inner = level == "low" ? 0.75f : level == "medium" ? 0.6f : level == "high" ? 0.45f : 9.f;
+    float outer = level == "low" ? 1.1f : level == "medium" ? 0.9f : level == "high" ? 0.75f : 9.f;
+    // the views' centres, from OpenXR's field of view (the left eye; the right one mirrored)
+    XrFovf fov{ -0.95f, 0.88f, 0.80f, -1.04f };
+    {
+        XrViewLocateInfo li{XR_TYPE_VIEW_LOCATE_INFO};
+        li.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+        li.displayTime = g.frame.predictedDisplayTime ? g.frame.predictedDisplayTime : 1;
+        li.space = g.local ? g.local : g.view;
+        XrViewState vs{XR_TYPE_VIEW_STATE};
+        XrView v[2] = { { XR_TYPE_VIEW }, { XR_TYPE_VIEW } };
+        uint32_t n = 0;
+        if (g.session && li.space && XR_SUCCEEDED(xrLocateViews(g.session, &li, &vs, 2, &n, v)) && n == 2 &&
+            v[0].fov.angleRight > v[0].fov.angleLeft)
+            fov = v[0].fov;
+    }
+    float tl = std::tan(-fov.angleLeft), tr = std::tan(fov.angleRight), tu = std::tan(fov.angleUp), td = std::tan(-fov.angleDown);
+    float cuLeft = tl / (tl + tr);   // fraction across from the left edge
+    float cvBottom = td / (tu + td);  // fraction up from the bottom (Echo's row 0)
+
+    uint32_t w = s->fdmWidth, h = s->fdmHeight, layers = (uint32_t)s->arraySize;
+    VkDeviceSize bytes = (VkDeviceSize)w * h * 2 * layers;
+    std::vector<uint8_t> texels(bytes);
+    for (uint32_t layer = 0; layer < layers; ++layer) {
+        float cu = layer == 1 ? 1 - cuLeft : cuLeft;   // the right eye's view is the left's mirrored
+        for (uint32_t y = 0; y < h; ++y)
+            for (uint32_t x = 0; x < w; ++x) {
+                uint8_t d = FoveationDensity((x + 0.5f) / w, (y + 0.5f) / h, cu, cvBottom, inner, outer);
+                size_t at = (((size_t)layer * h + y) * w + x) * 2;
+                texels[at] = texels[at + 1] = d;
+            }
+    }
+
+    // staging buffer -> every map
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkDeviceMemory bufMem = VK_NULL_HANDLE;
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = bytes;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bool staged = vkCreateBuffer(g.vkDevice, &bci, nullptr, &buf) == VK_SUCCESS;
+    if (staged) {
+        VkMemoryRequirements req;
+        vkGetBufferMemoryRequirements(g.vkDevice, buf, &req);
+        VkPhysicalDeviceMemoryProperties mem;
+        vkGetPhysicalDeviceMemoryProperties(g.vkPhysical, &mem);
+        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        ai.allocationSize = req.size;
+        ai.memoryTypeIndex = UINT32_MAX;
+        const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        for (uint32_t t = 0; t < mem.memoryTypeCount; ++t)
+            if ((req.memoryTypeBits & (1u << t)) && (mem.memoryTypes[t].propertyFlags & want) == want) { ai.memoryTypeIndex = t; break; }
+        void* map = nullptr;
+        staged = ai.memoryTypeIndex != UINT32_MAX && vkAllocateMemory(g.vkDevice, &ai, nullptr, &bufMem) == VK_SUCCESS &&
+                 vkBindBufferMemory(g.vkDevice, buf, bufMem, 0) == VK_SUCCESS &&
+                 vkMapMemory(g.vkDevice, bufMem, 0, bytes, 0, &map) == VK_SUCCESS;
+        if (staged) { memcpy(map, texels.data(), texels.size()); vkUnmapMemory(g.vkDevice, bufMem); }
+    }
+    if (!staged) LOGE("foveation maps: no staging buffer, full density instead");
+
     EnsureCommands();
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -607,20 +868,36 @@ void FillFoveationMaps(Swapchain* s) {
     vkBeginCommandBuffer(g.cmd, &bi);
     VkClearColorValue full{};
     full.float32[0] = full.float32[1] = 1;
-    VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, (uint32_t)s->arraySize };
+    VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers };
     for (VkImage img : s->fdm) {
         if (!img) continue;
-        Barrier(img, (uint32_t)s->arraySize, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
-        vkCmdClearColorImage(g.cmd, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &full, 1, &range);
+        Barrier(img, layers, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+        if (staged) {
+            std::vector<VkBufferImageCopy> copies(layers);
+            for (uint32_t layer = 0; layer < layers; ++layer) {
+                VkBufferImageCopy& c = copies[layer];
+                c.bufferOffset = (VkDeviceSize)layer * w * h * 2;
+                c.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, layer, 1 };
+                c.imageExtent = { w, h, 1 };
+            }
+            vkCmdCopyBufferToImage(g.cmd, buf, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, layers, copies.data());
+        } else {
+            vkCmdClearColorImage(g.cmd, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &full, 1, &range);
+        }
         if (g.hasFdm)
-            Barrier(img, (uint32_t)s->arraySize, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT,
+            Barrier(img, layers, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_FRAGMENT_DENSITY_MAP_OPTIMAL_EXT,
                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_FRAGMENT_DENSITY_MAP_READ_BIT_EXT);
         else
-            Barrier(img, (uint32_t)s->arraySize, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            Barrier(img, layers, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
     }
     vkEndCommandBuffer(g.cmd);
     SubmitAndWait();
+    if (buf) vkDestroyBuffer(g.vkDevice, buf, nullptr);
+    if (bufMem) vkFreeMemory(g.vkDevice, bufMem, nullptr);
+    if (level != "off")
+        LOG("foveation %s: centre %.2f across, %.2f up (left eye); full density to %.2f, half to %.2f, then a quarter",
+            level.c_str(), cuLeft, cvBottom, inner, outer);
 }
 
 void DestroyFoveationMaps(Swapchain* s) {
@@ -764,10 +1041,144 @@ Swapchain* FindSwapchain(const void* p) {
     return nullptr;
 }
 
+// Flip by copy: Echo's image (bottom-up rows), blitted upside down into the acquired image of
+// s->out, on Echo's queue after its own rendering. Command buffers go round four at a time,
+// each reused once its fence says the GPU is done with it.
+void EnsureFlipPool() {
+    if (!g.flipPool) {
+        VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        pi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        pi.queueFamilyIndex = g.queueFamily;
+        vkCreateCommandPool(g.vkDevice, &pi, nullptr, &g.flipPool);
+        VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        ai.commandPool = g.flipPool;
+        ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        ai.commandBufferCount = 4;
+        vkAllocateCommandBuffers(g.vkDevice, &ai, g.flipCmd);
+        VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        fi.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+        for (VkFence& f : g.flipFence) vkCreateFence(g.vkDevice, &fi, nullptr, &f);
+        ai.commandBufferCount = 8;
+        vkAllocateCommandBuffers(g.vkDevice, &ai, g.markCmd);
+        for (VkFence& f : g.markFence) vkCreateFence(g.vkDevice, &fi, nullptr, &f);
+        VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qi.queryCount = 16;
+        vkCreateQueryPool(g.vkDevice, &qi, nullptr, &g.gpuPool);
+        VkPhysicalDeviceProperties pp{};
+        vkGetPhysicalDeviceProperties(g.vkPhysical, &pp);
+        g.tsPeriod = pp.limits.timestampPeriod > 0 ? pp.limits.timestampPeriod : 1.0;
+    }
+}
+
+VkQueue EchoQueue() {
+    VkQueue q = VK_NULL_HANDLE;
+    vkGetDeviceQueue(g.vkDevice, g.queueFamily, g.queueIndex, &q);
+    return q;
+}
+
+// The start of a frame's GPU work: a timestamp after everything submitted before it.
+void GpuFrameStart(uint64_t frame) {
+    if (!g.flipCopy) return;
+    EnsureFlipPool();
+    uint32_t slot = (uint32_t)(frame % 8);
+    vkWaitForFences(g.vkDevice, 1, &g.markFence[slot], VK_TRUE, 100000000);
+    vkResetFences(g.vkDevice, 1, &g.markFence[slot]);
+    VkCommandBuffer cb = g.markCmd[slot];
+    vkResetCommandBuffer(cb, 0);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cb, &bi);
+    vkCmdResetQueryPool(cb, g.gpuPool, slot * 2, 2);
+    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.gpuPool, slot * 2);
+    vkEndCommandBuffer(cb);
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cb;
+    vkQueueSubmit(EchoQueue(), 1, &si, g.markFence[slot]);
+}
+
+// A finished frame's GPU time, read a few frames later without waiting.
+void GpuFrameCollect(uint64_t frame) {
+    if (!g.gpuPool || frame < 4) return;
+    uint32_t slot = (uint32_t)((frame - 4) % 8);
+    uint64_t ts[2] = {};
+    if (vkGetQueryPoolResults(g.vkDevice, g.gpuPool, slot * 2, 2, sizeof ts, ts, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) ==
+            VK_SUCCESS && ts[1] > ts[0]) {
+        g.gpuSum += (double)(ts[1] - ts[0]) * g.tsPeriod / 1e6;
+        g.gpuCount++;
+    }
+}
+
+void FlipCopy(Swapchain* s) {
+    if (s->acquired < 0 || s->outAcquired < 0) return;
+    EnsureFlipPool();
+    int i = g.flipNext;
+    g.flipNext = (i + 1) % 4;
+    vkWaitForFences(g.vkDevice, 1, &g.flipFence[i], VK_TRUE, 100000000);
+    vkResetFences(g.vkDevice, 1, &g.flipFence[i]);
+    VkCommandBuffer cb = g.flipCmd[i];
+    vkResetCommandBuffer(cb, 0);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cb, &bi);
+    VkImage src = s->images[s->acquired].image, dst = s->outImages[s->outAcquired].image;
+    uint32_t layers = (uint32_t)s->arraySize;
+    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.gpuPool, (uint32_t)(g.submitted % 8) * 2 + 1);
+    auto barrier = [&](VkImage img, VkImageLayout from, VkImageLayout to, VkAccessFlags a, VkAccessFlags b) {
+        VkImageMemoryBarrier m{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        m.srcAccessMask = a;
+        m.dstAccessMask = b;
+        m.oldLayout = from;
+        m.newLayout = to;
+        m.srcQueueFamilyIndex = m.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        m.image = img;
+        m.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers };
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
+                             nullptr, 1, &m);
+    };
+    // OpenXR hands images out, and takes them back, in COLOR_ATTACHMENT_OPTIMAL
+    barrier(src, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    barrier(dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+    VkImageBlit b{};
+    b.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, layers };
+    b.dstSubresource = b.srcSubresource;
+    b.srcOffsets[0] = { 0, 0, 0 };
+    b.srcOffsets[1] = { s->width, s->height, 1 };
+    b.dstOffsets[0] = { 0, s->height, 0 };   // top and bottom swapped: upside down
+    b.dstOffsets[1] = { s->width, 0, 1 };
+    vkCmdBlitImage(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b,
+                   VK_FILTER_NEAREST);
+    barrier(src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
+            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+    barrier(dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT);
+    vkEndCommandBuffer(cb);
+    VkQueue q = VK_NULL_HANDLE;
+    vkGetDeviceQueue(g.vkDevice, g.queueFamily, g.queueIndex, &q);
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cb;
+    VkResult r = vkQueueSubmit(q, 1, &si, g.flipFence[i]);
+    static bool logged = false;
+    if (!logged || r != VK_SUCCESS) {
+        logged = true;
+        LOG("flip copy: %dx%d x%u, submit %d", s->width, s->height, layers, r);
+    }
+}
+
+// The views Echo rendered a frame with, by the time it asked for them: they go to OpenXR
+// with the frame, so the compositor corrects from the pose Echo really used.
 const ViewCache* FindViews(double time) {
     const ViewCache* best = nullptr;
     for (const ViewCache& c : g.cache)
         if (c.time >= 0 && (!best || std::fabs(c.time - time) < std::fabs(best->time - time))) best = &c;
+    if (best && std::fabs(best->time - time) > 0.001) {
+        static int logged = 0;
+        if (logged++ < 10)
+            LOG("frame rendered with a pose for %.4f s that's no longer cached: nearest is %+.4f s off", time, best->time - time);
+    }
     return best;
 }
 
@@ -818,22 +1229,740 @@ const uint8_t kCapabilities[2][40] = {
       0x19, 0, 0, 0, 0x02, 0, 0, 0, 0x63, 0x5b, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
 };
 
+// ---------------------------------------------------------------------------
+// semaphore guard (not on Meta's runtime): Echo's frame submit waits on binary semaphores
+// Mesa (turnip, on Steam Frame) won't take without blocking: in its threaded submit mode it
+// waits inside vkQueueSubmit until each one's signal has reached the kernel, and Echo's main
+// loop hung there for good (CGS::EndFrame -> vkQueueSubmit -> drmSyncobjTimelineWait), even
+// though every wait had a signal submitted on the same queue first.
+// On the Frame build every Echo submit goes to one queue (the uploader shares the render
+// queue), and a queue runs its submits in order, so a wait on a semaphore signaled earlier
+// on the same queue adds nothing there. The guard drops those waits, and waits on
+// semaphores nothing signaled; it keeps waits on window-image acquires and other queues.
+// Echo calls Vulkan through a table of function pointers in libr15.so's data; the guard
+// swaps the submit, present, acquire and destroy entries for wrappers.
+// ---------------------------------------------------------------------------
+PFN_vkQueueSubmit g_realQueueSubmit;
+PFN_vkQueuePresentKHR g_realQueuePresent;
+PFN_vkAcquireNextImageKHR g_realAcquire;
+PFN_vkDestroySemaphore g_realDestroySemaphore;
+std::mutex g_semLock;
+// binary semaphores with a signal submitted and not yet waited on -> the queue that signals
+// them (VK_NULL_HANDLE: a window-image acquire)
+std::unordered_map<VkSemaphore, VkQueue> g_semPending;
+int g_semDroppedUnsignaled = 0, g_semDroppedSameQueue = 0;
+int g_semTrace = 60;   // calls to log in full, from the first
+PFN_vkQueueSubmit g_bypassSubmit = nullptr;   // vkQueueSubmit past the first layer, once that's known to work
+bool g_bypassTried = false;
+
+std::string Where(uintptr_t a);
+void LogProcessLimits();
+const VkAllocationCallbacks* WrapAllocator(const VkAllocationCallbacks* a);
+
+// vkQueueSubmit as the second layer (fossilize) sees it, skipping the first
+// (VALVE_fdm_injection). Android's loader hands layers the driver's own handles, and a
+// queue's first word is its device's dispatch key, which is how a layer's
+// vkGetDeviceProcAddr finds the device.
+PFN_vkQueueSubmit SubmitBelowFirstLayer(VkQueue queue) {
+    if (g.vkDevice && *reinterpret_cast<void**>(queue) != *reinterpret_cast<void**>(g.vkDevice)) {
+        LOG("semaphore guard: Echo's queue and device have different dispatch keys (a layer wraps them?): no bypass");
+        return nullptr;
+    }
+    VkDevice device = g.vkDevice ? g.vkDevice : reinterpret_cast<VkDevice>(queue);
+    void* lib = dlopen("libVkLayer_fossilize.so", RTLD_NOW | RTLD_NOLOAD);
+    if (!lib) { LOG("semaphore guard: the fossilize layer isn't loaded: no bypass"); return nullptr; }
+    auto gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(dlsym(lib, "vkGetDeviceProcAddr"));
+    if (!gdpa) gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(dlsym(lib, "VK_LAYER_fossilizeGetDeviceProcAddr"));
+    if (!gdpa) { LOG("semaphore guard: the fossilize layer exports no vkGetDeviceProcAddr: no bypass"); return nullptr; }
+    auto f = reinterpret_cast<PFN_vkQueueSubmit>(gdpa(device, "vkQueueSubmit"));
+    LOG("semaphore guard: vkQueueSubmit below the first layer: %s", f ? Where((uintptr_t)f).c_str() : "none");
+    return f;
+}
+
+void FilterWaits(VkQueue queue, const VkSemaphore* sems, const VkPipelineStageFlags* stages, uint32_t n,
+                 std::vector<VkSemaphore>& keep, std::vector<VkPipelineStageFlags>& keepStages, const char* where,
+                 std::string& trace) {   // g_semLock held
+    for (uint32_t i = 0; i < n; ++i) {
+        auto it = g_semPending.find(sems[i]);
+        const char* what;
+        if (it == g_semPending.end()) {
+            what = "unsignaled, dropped";
+            int c = ++g_semDroppedUnsignaled;
+            if (c <= 5 || (c & (c - 1)) == 0)
+                LOG("semaphore guard: %s waited on semaphore %p, which nothing has signaled: dropped (%d so far)",
+                    where, (void*)sems[i], c);
+        } else {
+            bool sameQueue = it->second != VK_NULL_HANDLE && it->second == queue;
+            g_semPending.erase(it);
+            if (sameQueue) {
+                what = "same queue, dropped";
+                if (++g_semDroppedSameQueue == 1) LOG("semaphore guard: dropping waits on semaphores signaled on the same queue");
+            } else {
+                what = "kept";
+                keep.push_back(sems[i]);
+                if (stages) keepStages.push_back(stages[i]);
+            }
+        }
+        if (g_semTrace > 0) {
+            char buf[96];
+            snprintf(buf, sizeof buf, " wait %p (%s)", (void*)sems[i], what);
+            trace += buf;
+        }
+    }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL GuardQueueSubmit(VkQueue queue, uint32_t count, const VkSubmitInfo* submits, VkFence fence) {
+    std::vector<VkSubmitInfo> copy(submits, submits + count);
+    std::vector<std::vector<VkSemaphore>> waits(count);
+    std::vector<std::vector<VkPipelineStageFlags>> stages(count);
+    std::string trace;
+    bool tracing;
+    {
+        std::lock_guard<std::mutex> lock(g_semLock);
+        tracing = g_semTrace > 0;
+        for (uint32_t i = 0; i < count; ++i) {
+            VkSubmitInfo& s = copy[i];
+            if (tracing) {
+                char buf[96];
+                snprintf(buf, sizeof buf, " [%u: %u cmd%s]", i, s.commandBufferCount, s.pNext ? " +pNext" : "");
+                trace += buf;
+            }
+            if (!s.pNext) {   // (a timeline or device-group pNext has arrays sized by the counts: leave it)
+                FilterWaits(queue, s.pWaitSemaphores, s.pWaitDstStageMask, s.waitSemaphoreCount, waits[i], stages[i],
+                            "a submit", trace);
+                s.waitSemaphoreCount = (uint32_t)waits[i].size();
+                s.pWaitSemaphores = waits[i].data();
+                s.pWaitDstStageMask = stages[i].data();
+            }
+            for (uint32_t j = 0; j < s.signalSemaphoreCount; ++j) {
+                g_semPending[s.pSignalSemaphores[j]] = queue;
+                if (tracing) {
+                    char buf[48];
+                    snprintf(buf, sizeof buf, " signal %p", (void*)s.pSignalSemaphores[j]);
+                    trace += buf;
+                }
+            }
+        }
+        if (tracing) --g_semTrace;
+    }
+    if (tracing) LOG("semaphore guard: submit on queue %p, fence %p:%s", (void*)queue, (void*)fence, trace.c_str());
+    PFN_vkQueueSubmit submit = g_bypassSubmit ? g_bypassSubmit : g_realQueueSubmit;
+    VkResult r = submit(queue, count, copy.data(), fence);
+    if (r != VK_SUCCESS && !g_bypassTried) {
+        // On Steam Frame every submit failed with -1 (out of host memory), even empty ones,
+        // through the layers Lepton loads (VALVE_fdm_injection, then fossilize). Once: try
+        // the same submit past the first layer, and keep that path if it works.
+        g_bypassTried = true;
+        PFN_vkQueueSubmit below = SubmitBelowFirstLayer(queue);
+        if (below) {
+            VkResult r2 = below(queue, count, copy.data(), fence);
+            LOG("semaphore guard: vkQueueSubmit failed (%d) through all layers; past the first layer: %d%s", (int)r, (int)r2,
+                r2 == VK_SUCCESS ? " -- submitting that way from now on" : "");
+            if (r2 == VK_SUCCESS) { g_bypassSubmit = below; r = r2; }
+        }
+    }
+    if (r != VK_SUCCESS) {
+        static int logged = 0;
+        if (logged++ < 10) LOG("semaphore guard: vkQueueSubmit failed (%d)", (int)r);
+        if (logged == 1) LogProcessLimits();
+        std::lock_guard<std::mutex> lock(g_semLock);   // its signals won't happen
+        for (const VkSubmitInfo& s : copy)
+            for (uint32_t j = 0; j < s.signalSemaphoreCount; ++j) g_semPending.erase(s.pSignalSemaphores[j]);
+    }
+    if (tracing) LOG("semaphore guard: submit returned %d", (int)r);
+    return r;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL GuardQueuePresent(VkQueue queue, const VkPresentInfoKHR* info) {
+    if (!info) return g_realQueuePresent(queue, info);
+    VkPresentInfoKHR copy = *info;
+    std::vector<VkSemaphore> waits;
+    std::vector<VkPipelineStageFlags> unused;
+    std::string trace;
+    bool tracing;
+    {
+        std::lock_guard<std::mutex> lock(g_semLock);
+        tracing = g_semTrace > 0;
+        // a present hands the image to the window, outside the queue: keep same-queue waits
+        for (uint32_t i = 0; i < info->waitSemaphoreCount; ++i) {
+            VkSemaphore sem = info->pWaitSemaphores[i];
+            if (g_semPending.erase(sem)) waits.push_back(sem);
+            else if (++g_semDroppedUnsignaled <= 5) LOG("semaphore guard: a present waited on unsignaled semaphore %p: dropped", (void*)sem);
+            if (tracing) {
+                char buf[64];
+                snprintf(buf, sizeof buf, " wait %p", (void*)sem);
+                trace += buf;
+            }
+        }
+        if (tracing) --g_semTrace;
+    }
+    copy.waitSemaphoreCount = (uint32_t)waits.size();
+    copy.pWaitSemaphores = waits.data();
+    VkResult r = g_realQueuePresent(queue, &copy);
+    if (tracing) LOG("semaphore guard: present on queue %p:%s -> %d", (void*)queue, trace.c_str(), (int)r);
+    return r;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL GuardAcquire(VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout, VkSemaphore sem,
+                                            VkFence fence, uint32_t* index) {
+    VkResult r = g_realAcquire(device, swapchain, timeout, sem, fence, index);
+    std::lock_guard<std::mutex> lock(g_semLock);
+    if (sem != VK_NULL_HANDLE && (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR)) g_semPending[sem] = VK_NULL_HANDLE;
+    if (g_semTrace > 0) {
+        --g_semTrace;
+        LOG("semaphore guard: acquire on swapchain %p, semaphore %p -> %d (image %u)", (void*)swapchain, (void*)sem, (int)r,
+            index ? *index : 0);
+    } else if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
+        static int logged = 0;
+        if (logged++ < 5) LOG("semaphore guard: acquiring a window image failed (%d)", (int)r);
+    }
+    return r;
+}
+
+VKAPI_ATTR void VKAPI_CALL GuardDestroySemaphore(VkDevice device, VkSemaphore sem, const VkAllocationCallbacks* alloc) {
+    {
+        std::lock_guard<std::mutex> lock(g_semLock);
+        g_semPending.erase(sem);
+    }
+    g_realDestroySemaphore(device, sem, WrapAllocator(alloc));
+}
+
+// the driver's warnings and errors (VK_EXT_debug_utils on Echo's instance)
+VKAPI_ATTR VkBool32 VKAPI_CALL VulkanMessage(VkDebugUtilsMessageSeverityFlagBitsEXT severity, VkDebugUtilsMessageTypeFlagsEXT,
+                                             const VkDebugUtilsMessengerCallbackDataEXT* data, void*) {
+    static std::atomic<int> count{0};
+    int n = ++count;
+    if (n <= 300)
+        LOG("Vulkan %s: %s", severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT ? "error" : "warning",
+            data && data->pMessage ? data->pMessage : "(no message)");
+    else if (n == 301)
+        LOG("Vulkan: more messages not logged");
+    return VK_FALSE;
+}
+
+void WatchVulkanMessages() {
+    auto create = reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(
+        vkGetInstanceProcAddr(g.vkInstance, "vkCreateDebugUtilsMessengerEXT"));
+    if (!create) { LOG("Vulkan messages: VK_EXT_debug_utils isn't enabled on Echo's instance"); return; }
+    VkDebugUtilsMessengerCreateInfoEXT ci{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
+    ci.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+    ci.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                     VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+    ci.pfnUserCallback = VulkanMessage;
+    VkDebugUtilsMessengerEXT messenger = VK_NULL_HANDLE;
+    VkResult r = create(g.vkInstance, &ci, nullptr, &messenger);
+    LOG("Vulkan messages: %s (%d)", r == VK_SUCCESS ? "logging the driver's warnings and errors" : "couldn't watch", (int)r);
+}
+
+// how many files the process has open, its limit, and its memory: Mesa answers "out of host
+// memory" when it can't make a sync object, e.g. when the process is out of file descriptors
+void LogProcessLimits() {
+    int fds = 0;
+    if (DIR* d = opendir("/proc/self/fd")) {
+        while (dirent* e = readdir(d)) if (e->d_name[0] != '.') ++fds;
+        closedir(d);
+    }
+    rlimit lim{};
+    getrlimit(RLIMIT_NOFILE, &lim);
+    std::string mem;
+    if (FILE* f = fopen("/proc/self/status", "r")) {
+        char line[128];
+        while (fgets(line, sizeof line, f))
+            if (!strncmp(line, "VmSize", 6) || !strncmp(line, "VmRSS", 5) || !strncmp(line, "Threads", 7)) {
+                line[strcspn(line, "\n")] = 0;
+                mem += " ";
+                mem += line;
+            }
+        fclose(f);
+    }
+    LOG("process: %d files open (limit %llu),%s", fds, (unsigned long long)lim.rlim_cur, mem.c_str());
+}
+
+// an empty submit with a fence on the queue Echo and OpenXR use: does the queue work at all?
+void TestSubmit(const char* when) {
+    VkQueue queue = VK_NULL_HANDLE;
+    vkGetDeviceQueue(g.vkDevice, g.queueFamily, 0, &queue);
+    VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkFence fence = VK_NULL_HANDLE;
+    VkResult rf = vkCreateFence(g.vkDevice, &fi, nullptr, &fence);
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    VkResult rs = vkQueueSubmit(queue, 1, &si, fence);
+    VkResult rw = rs == VK_SUCCESS ? vkWaitForFences(g.vkDevice, 1, &fence, VK_TRUE, 1000000000ull) : VK_NOT_READY;
+    VkResult rn = vkQueueSubmit(queue, 0, nullptr, VK_NULL_HANDLE);
+    LOG("test submit %s: create fence %d, empty submit with fence %d, wait %d, submit of nothing %d", when, (int)rf, (int)rs,
+        (int)rw, (int)rn);
+    if (fence) vkDestroyFence(g.vkDevice, fence, nullptr);
+    if (rs != VK_SUCCESS) LogProcessLimits();
+}
+
+// ---------------------------------------------------------------------------
+// allocator wrapper (with the semaphore guard): Echo hands the driver its own allocation
+// callbacks (NRadEngine::VkAllocator) on every Vulkan call, the device's included, which the
+// driver keeps for everything it allocates internally. On Steam Frame (Mesa) every submit
+// then failed with VK_ERROR_OUT_OF_HOST_MEMORY, even empty ones, and later Echo crashed in
+// the driver on a NULL. The wrapper passes Echo's callbacks on, and when they return nothing
+// (Mesa asks for 0 bytes now and then) it allocates from the C library instead and
+// remembers the block, so each block is freed by whoever allocated it. Logged as
+// "Vulkan allocator: ...".
+// ---------------------------------------------------------------------------
+struct WrappedAllocator {
+    VkAllocationCallbacks mine;
+    VkAllocationCallbacks echo;
+};
+std::mutex g_allocLock;
+std::vector<WrappedAllocator*> g_wrappedAllocators;   // never freed: the driver keeps copies
+std::unordered_map<void*, size_t> g_fallbackBlocks;   // from the C library -> size
+std::atomic<int> g_fallbacks{0};
+
+void* FallbackAlloc(size_t size, size_t align, VkSystemAllocationScope scope, const char* why) {
+    void* p = nullptr;
+    if (posix_memalign(&p, std::max<size_t>(align, sizeof(void*)), size ? size : 1) != 0) return nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_allocLock);
+        g_fallbackBlocks[p] = size;
+    }
+    int n = ++g_fallbacks;
+    if (n <= 10 || (n & (n - 1)) == 0)
+        LOG("Vulkan allocator: %s %zu bytes (alignment %zu, scope %d): took them from the C library (%d so far)", why, size,
+            align, (int)scope, n);
+    return p;
+}
+
+bool TakeFallback(void* p, size_t* size) {
+    std::lock_guard<std::mutex> lock(g_allocLock);
+    auto it = g_fallbackBlocks.find(p);
+    if (it == g_fallbackBlocks.end()) return false;
+    if (size) *size = it->second;
+    g_fallbackBlocks.erase(it);
+    return true;
+}
+
+VKAPI_ATTR void* VKAPI_CALL WrappedAlloc(void* ud, size_t size, size_t align, VkSystemAllocationScope scope) {
+    const VkAllocationCallbacks& echo = static_cast<WrappedAllocator*>(ud)->echo;
+    if (size) {
+        if (void* p = echo.pfnAllocation(echo.pUserData, size, align, scope)) return p;
+        return FallbackAlloc(size, align, scope, "Echo's allocator refused");
+    }
+    return FallbackAlloc(size, align, scope, "the driver asked for");
+}
+
+VKAPI_ATTR void VKAPI_CALL WrappedFree(void* ud, void* p) {
+    if (!p) return;
+    if (TakeFallback(p, nullptr)) { free(p); return; }
+    const VkAllocationCallbacks& echo = static_cast<WrappedAllocator*>(ud)->echo;
+    echo.pfnFree(echo.pUserData, p);
+}
+
+VKAPI_ATTR void* VKAPI_CALL WrappedRealloc(void* ud, void* old, size_t size, size_t align, VkSystemAllocationScope scope) {
+    if (!old) return WrappedAlloc(ud, size, align, scope);
+    if (!size) { WrappedFree(ud, old); return nullptr; }
+    size_t oldSize = 0;
+    if (TakeFallback(old, &oldSize)) {
+        void* p = FallbackAlloc(size, align, scope, "reallocating");
+        if (p) memcpy(p, old, std::min(oldSize, size));
+        free(old);
+        return p;
+    }
+    const VkAllocationCallbacks& echo = static_cast<WrappedAllocator*>(ud)->echo;
+    void* p = echo.pfnReallocation(echo.pUserData, old, size, align, scope);
+    if (!p) LOG("Vulkan allocator: Echo's allocator couldn't grow a block to %zu bytes", size);
+    return p;
+}
+
+const VkAllocationCallbacks* WrapAllocator(const VkAllocationCallbacks* a) {
+    if (!a || a->pfnAllocation == WrappedAlloc) return a;
+    std::lock_guard<std::mutex> lock(g_allocLock);
+    for (WrappedAllocator* w : g_wrappedAllocators)
+        if (w->echo.pfnAllocation == a->pfnAllocation && w->echo.pfnFree == a->pfnFree &&
+            w->echo.pfnReallocation == a->pfnReallocation && w->echo.pUserData == a->pUserData)
+            return &w->mine;
+    WrappedAllocator* w = new WrappedAllocator{};
+    w->echo = *a;
+    w->mine.pUserData = w;
+    w->mine.pfnAllocation = WrappedAlloc;
+    w->mine.pfnReallocation = WrappedRealloc;
+    w->mine.pfnFree = WrappedFree;   // (Echo's internal-allocation notifications are no-ops: left out)
+    g_wrappedAllocators.push_back(w);
+    if (g_wrappedAllocators.size() <= 3) LOG("Vulkan allocator: wrapping Echo's allocation callbacks (%zu so far)", g_wrappedAllocators.size());
+    return &w->mine;
+}
+
+// Echo reads its GPU timers every frame with VK_QUERY_RESULT_WAIT_BIT
+// (CGTimerQueryPoolVK::PrepareTimers), which on Steam Frame stalled its main loop on the GPU
+// each frame; it ignores the result, so without the wait it reads what's ready (its GPU
+// statistics may lag a frame).
+PFN_vkGetQueryPoolResults g_realGetQueryPoolResults;
+std::atomic<int> g_timerWaitsSkipped{0};
+
+VKAPI_ATTR VkResult VKAPI_CALL HookGetQueryPoolResults(VkDevice device, VkQueryPool pool, uint32_t first, uint32_t count,
+                                                       size_t size, void* data, VkDeviceSize stride, VkQueryResultFlags flags) {
+    if (!(flags & VK_QUERY_RESULT_WAIT_BIT)) return g_realGetQueryPoolResults(device, pool, first, count, size, data, stride, flags);
+    VkResult r = g_realGetQueryPoolResults(device, pool, first, count, size, data, stride, flags & ~VK_QUERY_RESULT_WAIT_BIT);
+    if (r == VK_NOT_READY) ++g_timerWaitsSkipped;
+    return r;
+}
+
+PFN_vkCreateInstance g_realCreateInstance;
+PFN_vkCreateDevice g_realCreateDevice;
+
+VKAPI_ATTR VkResult VKAPI_CALL HookCreateInstance(const VkInstanceCreateInfo* info, const VkAllocationCallbacks* alloc,
+                                                  VkInstance* instance) {
+    VkResult r = g_realCreateInstance(info, WrapAllocator(alloc), instance);
+    LOG("Vulkan allocator: Echo created its instance through the wrapper (%s allocator): %d", alloc ? "its own" : "no", (int)r);
+    return r;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL HookCreateDevice(VkPhysicalDevice gpu, const VkDeviceCreateInfo* info,
+                                                const VkAllocationCallbacks* alloc, VkDevice* device) {
+    VkResult r = g_realCreateDevice(gpu, info, WrapAllocator(alloc), device);
+    LOG("Vulkan allocator: Echo created its device through the wrapper (%s allocator): %d", alloc ? "its own" : "no", (int)r);
+    return r;
+}
+
+// Every other call that takes an allocator: the same call with the allocator wrapped. All
+// their arguments are integers or pointers (x0-x7 on arm64), so one template covers them.
+using AnyVkFn = uintptr_t (*)(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t);
+void* g_allocReal[64];
+
+template <int I, int Arg>
+uintptr_t AllocThunk(uintptr_t a0, uintptr_t a1, uintptr_t a2, uintptr_t a3, uintptr_t a4, uintptr_t a5, uintptr_t a6,
+                     uintptr_t a7) {
+    uintptr_t a[8] = { a0, a1, a2, a3, a4, a5, a6, a7 };
+    a[Arg] = reinterpret_cast<uintptr_t>(WrapAllocator(reinterpret_cast<const VkAllocationCallbacks*>(a[Arg])));
+    return reinterpret_cast<AnyVkFn>(g_allocReal[I])(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
+}
+
+struct VulkanHook {
+    const char* name;
+    void* hook;
+    void** real;
+    std::set<uintptr_t> originals;   // every address Echo might hold for it
+    int replaced;
+};
+
+#define ALLOC_HOOK(I, name, arg) { name, (void*)&AllocThunk<I, arg>, &g_allocReal[I], {}, 0 }
+
+std::vector<VulkanHook>& VulkanHooks() {
+    static std::vector<VulkanHook> hooks = {
+        { "vkQueueSubmit", (void*)GuardQueueSubmit, (void**)&g_realQueueSubmit, {}, 0 },
+        { "vkQueuePresentKHR", (void*)GuardQueuePresent, (void**)&g_realQueuePresent, {}, 0 },
+        { "vkAcquireNextImageKHR", (void*)GuardAcquire, (void**)&g_realAcquire, {}, 0 },
+        { "vkDestroySemaphore", (void*)GuardDestroySemaphore, (void**)&g_realDestroySemaphore, {}, 0 },
+        { "vkCreateInstance", (void*)HookCreateInstance, (void**)&g_realCreateInstance, {}, 0 },
+        { "vkCreateDevice", (void*)HookCreateDevice, (void**)&g_realCreateDevice, {}, 0 },
+        { "vkGetQueryPoolResults", (void*)HookGetQueryPoolResults, (void**)&g_realGetQueryPoolResults, {}, 0 },
+        ALLOC_HOOK(0, "vkDestroyInstance", 1),
+        ALLOC_HOOK(1, "vkDestroyDevice", 1),
+        ALLOC_HOOK(2, "vkAllocateMemory", 2),
+        ALLOC_HOOK(3, "vkFreeMemory", 2),
+        ALLOC_HOOK(4, "vkCreateFence", 2),
+        ALLOC_HOOK(5, "vkDestroyFence", 2),
+        ALLOC_HOOK(6, "vkCreateSemaphore", 2),
+        ALLOC_HOOK(7, "vkCreateEvent", 2),
+        ALLOC_HOOK(8, "vkDestroyEvent", 2),
+        ALLOC_HOOK(9, "vkCreateQueryPool", 2),
+        ALLOC_HOOK(10, "vkDestroyQueryPool", 2),
+        ALLOC_HOOK(11, "vkCreateBuffer", 2),
+        ALLOC_HOOK(12, "vkDestroyBuffer", 2),
+        ALLOC_HOOK(13, "vkCreateBufferView", 2),
+        ALLOC_HOOK(14, "vkDestroyBufferView", 2),
+        ALLOC_HOOK(15, "vkCreateImage", 2),
+        ALLOC_HOOK(16, "vkDestroyImage", 2),
+        ALLOC_HOOK(17, "vkCreateImageView", 2),
+        ALLOC_HOOK(18, "vkDestroyImageView", 2),
+        ALLOC_HOOK(19, "vkCreateShaderModule", 2),
+        ALLOC_HOOK(20, "vkDestroyShaderModule", 2),
+        ALLOC_HOOK(21, "vkCreatePipelineCache", 2),
+        ALLOC_HOOK(22, "vkDestroyPipelineCache", 2),
+        ALLOC_HOOK(23, "vkCreateGraphicsPipelines", 4),
+        ALLOC_HOOK(24, "vkCreateComputePipelines", 4),
+        ALLOC_HOOK(25, "vkDestroyPipeline", 2),
+        ALLOC_HOOK(26, "vkCreatePipelineLayout", 2),
+        ALLOC_HOOK(27, "vkDestroyPipelineLayout", 2),
+        ALLOC_HOOK(28, "vkCreateSampler", 2),
+        ALLOC_HOOK(29, "vkDestroySampler", 2),
+        ALLOC_HOOK(30, "vkCreateDescriptorSetLayout", 2),
+        ALLOC_HOOK(31, "vkDestroyDescriptorSetLayout", 2),
+        ALLOC_HOOK(32, "vkCreateDescriptorPool", 2),
+        ALLOC_HOOK(33, "vkDestroyDescriptorPool", 2),
+        ALLOC_HOOK(34, "vkCreateFramebuffer", 2),
+        ALLOC_HOOK(35, "vkDestroyFramebuffer", 2),
+        ALLOC_HOOK(36, "vkCreateRenderPass", 2),
+        ALLOC_HOOK(37, "vkDestroyRenderPass", 2),
+        ALLOC_HOOK(38, "vkCreateCommandPool", 2),
+        ALLOC_HOOK(39, "vkDestroyCommandPool", 2),
+        ALLOC_HOOK(40, "vkCreateSwapchainKHR", 2),
+        ALLOC_HOOK(41, "vkDestroySwapchainKHR", 2),
+        ALLOC_HOOK(42, "vkCreateAndroidSurfaceKHR", 2),
+        ALLOC_HOOK(43, "vkDestroySurfaceKHR", 2),
+        ALLOC_HOOK(44, "vkCreateDebugReportCallbackEXT", 2),
+        ALLOC_HOOK(45, "vkDestroyDebugReportCallbackEXT", 2),
+        ALLOC_HOOK(46, "vkCreateDebugUtilsMessengerEXT", 2),
+        ALLOC_HOOK(47, "vkDestroyDebugUtilsMessengerEXT", 2),
+        ALLOC_HOOK(48, "vkCreateRenderPass2KHR", 2),
+        ALLOC_HOOK(49, "vkCreateSamplerYcbcrConversion", 2),
+        ALLOC_HOOK(50, "vkDestroySamplerYcbcrConversion", 2),
+        ALLOC_HOOK(51, "vkCreateDescriptorUpdateTemplate", 2),
+        ALLOC_HOOK(52, "vkDestroyDescriptorUpdateTemplate", 2),
+    };
+    return hooks;
+}
+
+// What vkGetInstanceProcAddr hands out for each hooked function, from the throwaway
+// instance SupportedVulkanExtensions makes before Echo's exists: Echo's tables hold these
+// (Android's libvulkan gives every instance the same entry points), not libvulkan's exported
+// symbols, so this is what lets the hooks go in before Echo creates its device.
+std::map<std::string, std::vector<uintptr_t>> g_probedProcs;
+
+void ProbeProcAddrs(VkInstance instance) {
+    if (!g.semaphoreGuard) return;
+    int n = 0;
+    for (VulkanHook& h : VulkanHooks())
+        if (auto p = vkGetInstanceProcAddr(instance, h.name)) { g_probedProcs[h.name].push_back((uintptr_t)p); ++n; }
+    LOG("Vulkan hooks: %d entry points looked up ahead of Echo's instance", n);
+}
+
+struct WritableRanges {
+    std::vector<std::pair<uintptr_t, uintptr_t>> rw;
+    uintptr_t relro0 = 0, relro1 = 0;
+};
+
+int FindLibr15(dl_phdr_info* info, size_t, void* data) {
+    const char* name = info->dlpi_name ? strrchr(info->dlpi_name, '/') : nullptr;
+    if (!name || strcmp(name, "/libr15.so") != 0) return 0;
+    WritableRanges& r = *static_cast<WritableRanges*>(data);
+    for (int i = 0; i < info->dlpi_phnum; ++i) {
+        const ElfW(Phdr)& ph = info->dlpi_phdr[i];
+        uintptr_t a = info->dlpi_addr + ph.p_vaddr;
+        if (ph.p_type == PT_LOAD && (ph.p_flags & PF_W)) r.rw.push_back({ a, a + ph.p_memsz });
+        if (ph.p_type == PT_GNU_RELRO) { r.relro0 = a; r.relro1 = a + ph.p_memsz; }
+    }
+    return 1;
+}
+
+// Replaces, in libr15.so's writable data (not its RELRO, which is read-only), every pointer
+// to one of the hooked functions: Echo loads libvulkan itself and keeps the addresses it
+// gets in tables. Can run again: what's replaced isn't found a second time.
+int InstallVulkanHooks(const char* when, bool quiet = false) {
+    static std::mutex installLock;
+    std::lock_guard<std::mutex> installing(installLock);
+    std::vector<VulkanHook>& hooks = VulkanHooks();
+    void* libvulkan = dlopen("libvulkan.so", RTLD_NOW | RTLD_NOLOAD);
+    for (VulkanHook& h : hooks) {
+        if (libvulkan) if (void* p = dlsym(libvulkan, h.name)) h.originals.insert((uintptr_t)p);
+        if (g.vkInstance) if (auto p = vkGetInstanceProcAddr(g.vkInstance, h.name)) h.originals.insert((uintptr_t)p);
+        if (g.vkDevice) if (auto p = vkGetDeviceProcAddr(g.vkDevice, h.name)) h.originals.insert((uintptr_t)p);
+        auto probed = g_probedProcs.find(h.name);
+        if (probed != g_probedProcs.end()) h.originals.insert(probed->second.begin(), probed->second.end());
+        h.originals.erase(0);
+        h.originals.erase((uintptr_t)h.hook);
+        if (!*h.real && !h.originals.empty()) *h.real = reinterpret_cast<void*>(*h.originals.begin());
+    }
+    WritableRanges ranges;
+    dl_iterate_phdr(FindLibr15, &ranges);
+    if (ranges.rw.empty()) { if (!quiet) LOGE("Vulkan hooks: libr15.so isn't loaded"); return 0; }
+    uintptr_t lo = UINTPTR_MAX, hi = 0;   // a quick test first: almost no word is in range
+    for (VulkanHook& h : hooks)
+        for (uintptr_t a : h.originals) { lo = std::min(lo, a); hi = std::max(hi, a); }
+    int found = 0;
+    std::string names;
+    for (auto& rw : ranges.rw) {
+        uintptr_t* p = reinterpret_cast<uintptr_t*>((rw.first + 7) & ~(uintptr_t)7);
+        uintptr_t* end = reinterpret_cast<uintptr_t*>(rw.second & ~(uintptr_t)7);
+        for (; p < end; ++p) {
+            if ((uintptr_t)p >= ranges.relro0 && (uintptr_t)p < ranges.relro1) continue;
+            uintptr_t v = *p;
+            if (v < lo || v > hi) continue;
+            for (VulkanHook& h : hooks) {
+                if (!h.originals.count(v)) continue;
+                *h.real = reinterpret_cast<void*>(v);   // any of them does the same
+                *p = reinterpret_cast<uintptr_t>(h.hook);
+                if (!h.replaced++ && names.size() < 600) names += std::string(" ") + h.name;
+                ++found;
+                break;
+            }
+        }
+    }
+    if (!quiet || found) LOG("Vulkan hooks (%s): %d entr%s replaced, new:%s", when, found, found == 1 ? "y" : "ies", names.c_str());
+    return found;
+}
+
+std::atomic<bool> g_firstFrame{false};
+
+// Echo creates its instance and device, and uploads its first textures, before
+// CreateSystemVulkan: watch for its tables from vrapi_Initialize on (every 2 ms) until its
+// first frame, so the wrappers are in before it creates anything.
+void WatchForVulkanTables() {
+    for (int i = 0; i < 60000 && !g_firstFrame.load(); ++i) {
+        InstallVulkanHooks("watching", true);
+        usleep(2000);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// hang watchdog: Echo calls vrapi_PollEvent every frame. When it hasn't for 4 seconds
+// (on Steam Frame Echo stopped right after loading, "Deadlock detected!"), log where each
+// of Echo's threads is: a signal makes each thread copy its registers and the top of its
+// stack, and this thread turns the code addresses into library + offset. Logged as
+// "hang: ..." at most 3 times per run.
+// ---------------------------------------------------------------------------
+std::atomic<double> g_lastPoll{0};
+std::atomic<pid_t> g_echoTid{0};
+
+struct StackSample {
+    std::atomic<int> done{0};
+    uintptr_t pc = 0, lr = 0, sp = 0;
+    uintptr_t chain[48];   // return addresses along the frame-pointer chain
+    int nchain = 0;
+    uintptr_t stack[512];  // the top of the stack, for return addresses the chain missed
+    int nstack = 0;
+};
+StackSample g_sample;
+
+constexpr uintptr_t kAddrMask = 0x0000ffffffffffffull;   // drop pointer-authentication bits
+
+void SampleHandler(int, siginfo_t*, void* ucv) {   // async-signal-safe: plain loads and stores
+    const mcontext_t& m = static_cast<ucontext_t*>(ucv)->uc_mcontext;
+    StackSample& s = g_sample;
+    s.pc = m.pc & kAddrMask;
+    s.lr = m.regs[30] & kAddrMask;
+    s.sp = m.sp;
+    uintptr_t fp = m.regs[29], top = m.sp;
+    s.nchain = 0;
+    while (s.nchain < 48 && fp >= m.sp && fp < m.sp + (1u << 20) && !(fp & 15)) {
+        const uintptr_t* f = reinterpret_cast<const uintptr_t*>(fp);
+        s.chain[s.nchain++] = f[1] & kAddrMask;
+        top = fp + 16;
+        if (f[0] <= fp) break;
+        fp = f[0];
+    }
+    // copy only what the frame chain showed is stack (reading past its top could fault)
+    size_t bytes = std::min<size_t>(sizeof(s.stack), std::max<uintptr_t>(top - m.sp, 64));
+    memcpy(s.stack, reinterpret_cast<const void*>(m.sp), bytes);
+    s.nstack = (int)(bytes / sizeof(uintptr_t));
+    s.done.store(1);
+}
+
+std::string Where(uintptr_t a) {
+    Dl_info info{};
+    if (!a || !dladdr(reinterpret_cast<void*>(a), &info) || !info.dli_fname) return "";
+    const char* lib = strrchr(info.dli_fname, '/');
+    lib = lib ? lib + 1 : info.dli_fname;
+    char buf[320];
+    if (info.dli_sname && info.dli_saddr)
+        snprintf(buf, sizeof buf, "%s+0x%llx (%s+0x%llx)", lib, (unsigned long long)(a - (uintptr_t)info.dli_fbase),
+                 info.dli_sname, (unsigned long long)(a - (uintptr_t)info.dli_saddr));
+    else
+        snprintf(buf, sizeof buf, "%s+0x%llx", lib, (unsigned long long)(a - (uintptr_t)info.dli_fbase));
+    return buf;
+}
+
+std::string ReadSmall(const std::string& path) {
+    FILE* f = fopen(path.c_str(), "r");
+    if (!f) return "";
+    char buf[256] = "";
+    size_t n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    std::string s(buf, n);
+    while (!s.empty() && (s.back() == '\n' || s.back() == ' ')) s.pop_back();
+    return s;
+}
+
+void DumpThread(pid_t tid, int sig, bool full) {
+    std::string dir = "/proc/self/task/" + std::to_string(tid);
+    std::string stat = ReadSmall(dir + "/stat");
+    size_t paren = stat.rfind(')');
+    char state = paren != std::string::npos && paren + 2 < stat.size() ? stat[paren + 2] : '?';
+    LOG("hang: thread %d '%s'%s, state %c, waiting in %s", tid, ReadSmall(dir + "/comm").c_str(),
+        tid == g_echoTid.load() ? " (Echo's main loop)" : "", state, ReadSmall(dir + "/wchan").c_str());
+    if (!full) return;   // (only Echo's main loop in full: the log keeps its start)
+    g_sample.done.store(0);
+    if (syscall(SYS_tgkill, getpid(), tid, sig) != 0) { LOG("hang:   couldn't signal it"); return; }
+    for (int i = 0; i < 40 && !g_sample.done.load(); ++i) usleep(5000);
+    if (!g_sample.done.load()) { LOG("hang:   no answer (blocked in the kernel?)"); return; }
+    const StackSample& s = g_sample;
+    LOG("hang:   pc %s", Where(s.pc).c_str());
+    LOG("hang:   lr %s", Where(s.lr).c_str());
+    for (int i = 0; i < s.nchain; ++i) {
+        std::string w = Where(s.chain[i]);
+        if (!w.empty()) LOG("hang:   #%02d %s", i, w.c_str());
+    }
+    int shown = 0;
+    for (int i = 0; i < s.nstack && shown < 24; ++i) {
+        std::string w = Where(s.stack[i] & kAddrMask);
+        if (w.find(".so+") == std::string::npos) continue;
+        LOG("hang:   sp+0x%x: %s", i * 8, w.c_str());
+        ++shown;
+    }
+}
+
+void DumpThreads(double idle) {
+    static bool installed = false;
+    int sig = SIGRTMIN + 2;
+    if (!installed) {
+        struct sigaction sa{};
+        sa.sa_sigaction = SampleHandler;
+        sa.sa_flags = SA_SIGINFO | SA_RESTART;
+        sigemptyset(&sa.sa_mask);
+        installed = sigaction(sig, &sa, nullptr) == 0;
+        if (!installed) { LOGE("hang: couldn't install the sampling signal handler"); return; }
+    }
+    LOG("hang: Echo hasn't polled VrApi for %.1f s (session state %d, running %d): where its threads are", idle,
+        (int)g.state, (int)g.running);
+    std::vector<pid_t> tids;
+    if (DIR* d = opendir("/proc/self/task")) {
+        while (dirent* e = readdir(d)) if (e->d_name[0] != '.') tids.push_back((pid_t)atoi(e->d_name));
+        closedir(d);
+    }
+    pid_t self = (pid_t)syscall(SYS_gettid), echo = g_echoTid.load();
+    std::stable_partition(tids.begin(), tids.end(), [&](pid_t t) { return t == echo; });   // Echo's loop first
+    for (pid_t t : tids) if (t != self) DumpThread(t, sig, t == echo);
+    LOG("hang: end of threads");
+}
+
+void HangWatch() {
+    int dumps = 0;
+    bool reported = false;
+    for (;;) {
+        usleep(500000);
+        double last = g_lastPoll.load();
+        if (!last) continue;
+        double idle = Now() - last;
+        if (idle < 1) reported = false;
+        else if (idle > 4 && !reported && dumps < 3) { reported = true; ++dumps; DumpThreads(idle); }
+    }
+}
+
 }  // namespace
 
 // ===========================================================================
 // VrApi
 // ===========================================================================
+// An option: the debug.echoquestxr.<name> system property.
+static void Option(const char* name, char (&out)[PROP_VALUE_MAX]) {
+    char prop[64];
+    snprintf(prop, sizeof prop, "debug.echoquestxr.%s", name);
+    out[0] = 0;
+    __system_property_get(prop, out);
+}
+
+static char g_flipOption[PROP_VALUE_MAX] = "";   // "", 0, fov or copy: decided once the runtime is known
+
 EXPORT int32_t vrapi_Initialize(const vr::InitParms* p) {
     if (g.instance) return vr::kSuccess;
     if (!p || !p->java.Vm) return -1;
+    static bool watching = false;
+    if (!watching) { watching = true; std::thread(HangWatch).detach(); }
     char pose[PROP_VALUE_MAX] = "";
-    __system_property_get("debug.echoquestxr.pose", pose);
+    Option("pose", pose);
     g.useAimPose = strcmp(pose, "grip") != 0;   // aim matches VrApi's controller pose (tested on Quest 3)
-    char flip[PROP_VALUE_MAX] = "";
-    __system_property_get("debug.echoquestxr.flip", flip);
-    g.flipY = strcmp(flip, "0") != 0;
+    Option("flip", g_flipOption);
+    g.flipY = strcmp(g_flipOption, "0") != 0;
+    char fovProp[PROP_VALUE_MAX] = "";
+    Option("fov", fovProp);
+    g.useEchoFov = strcmp(fovProp, "openxr") != 0;
     char test[PROP_VALUE_MAX] = "";
-    __system_property_get("debug.echoquestxr.test", test);
+    Option("test", test);
     g.testRed = !strcmp(test, "red") || !strcmp(test, "redprobe");
     g.testProbe = !strcmp(test, "probe") || !strcmp(test, "redprobe");
     if (g.testRed) LOG("TEST MODE: every submitted image is painted red");
@@ -912,11 +2041,29 @@ EXPORT int32_t vrapi_Initialize(const vr::InitParms* p) {
         XR_VERSION_MAJOR(ip.runtimeVersion), XR_VERSION_MINOR(ip.runtimeVersion), XR_VERSION_PATCH(ip.runtimeVersion),
         sp.systemName, vcv[0].recommendedImageRectWidth, vcv[0].recommendedImageRectHeight,
         vcv[0].maxImageRectWidth, vcv[0].maxImageRectHeight);
+    // the semaphore guard: off on Meta's runtime (Quest's driver doesn't need it), on
+    // elsewhere; debug.echoquestxr.semguard 0/1 overrides
+    char guard[PROP_VALUE_MAX] = "";
+    Option("semguard", guard);
+    bool meta = strstr(ip.runtimeName, "Oculus") || strstr(ip.runtimeName, "Meta");
+    g.semaphoreGuard = guard[0] ? guard[0] == '1' : !meta;
+    LOG("semaphore guard: %s", g.semaphoreGuard ? "on" : "off");
+    // How to flip: by fov on Meta's runtime (tested on Quest 3), by copy elsewhere. On Steam
+    // Frame (asymmetric vertical fov) the upside-down fov left everything too high and the
+    // world swimming as the head moved; a plain, upright image needs nothing of the compositor.
+    g.flipCopy = g.flipY && (!strcmp(g_flipOption, "copy") || (strcmp(g_flipOption, "fov") != 0 && !meta));
+    LOG("flip: %s", !g.flipY ? "off" : g.flipCopy ? "by copy" : "by fov");
+    if (g.semaphoreGuard) std::thread(WatchForVulkanTables).detach();
     return vr::kSuccess;
 }
 
 EXPORT void vrapi_Shutdown() {
-    for (Swapchain* s : g.swapchains) { DestroyFoveationMaps(s); xrDestroySwapchain(s->handle); delete s; }
+    for (Swapchain* s : g.swapchains) {
+        DestroyFoveationMaps(s);
+        if (s->out) xrDestroySwapchain(s->out);
+        xrDestroySwapchain(s->handle);
+        delete s;
+    }
     g.swapchains.clear();
     if (g.session) xrDestroySession(g.session);
     if (g.instance) xrDestroyInstance(g.instance);
@@ -988,8 +2135,18 @@ EXPORT int32_t vrapi_ShowSystemUI(const vr::Java*, int32_t) { return vr::kSucces
 
 EXPORT int32_t vrapi_SetDisplayRefreshRate(void*, float rate) {
     if (g.requestRate && g.session) {
+        // Steam Frame: the patcher's "Refresh=" setting replaces Echo's request (72 Hz), or
+        // with Refresh=default nothing is requested and SteamVR keeps its own rate
+        const std::string& want = FrameSettings().refresh;
+        std::string rates;
+        for (float f : RefreshRates()) rates += std::to_string((int)f) + " ";
+        if (want == "default") {
+            LOG("refresh rate: Echo asked for %.0f, left at SteamVR's %.0f (offered: %s)", rate, RefreshRate(), rates.c_str());
+            return vr::kSuccess;
+        }
+        if (!want.empty()) rate = (float)atof(want.c_str());
         XrResult r = g.requestRate(g.session, rate);
-        LOG("refresh rate %.0f requested: %d (now %.0f)", rate, (int)r, RefreshRate());
+        LOG("refresh rate %.0f requested: %d (now %.0f; offered: %s)", rate, (int)r, RefreshRate(), rates.c_str());
     }
     return vr::kSuccess;   // Steam Frame ignores the request; report success like the Quest does
 }
@@ -998,6 +2155,7 @@ EXPORT int32_t vrapi_SetDisplayRefreshRate(void*, float rate) {
 // Vulkan
 // ---------------------------------------------------------------------------
 EXPORT int32_t vrapi_GetInstanceExtensionsVulkan(char* names, uint32_t* size) {
+    if (g.semaphoreGuard) InstallVulkanHooks("instance extensions asked for", true);   // before Echo creates its instance
     if (!g.probedDeviceExts) SupportedVulkanExtensions(true);   // now, before Echo's instance exists
     std::string runtime;
     uint32_t n = 0;
@@ -1008,11 +2166,15 @@ EXPORT int32_t vrapi_GetInstanceExtensionsVulkan(char* names, uint32_t* size) {
     }
     std::string list = MergeExtensions("VK_KHR_surface VK_KHR_android_surface VK_KHR_external_memory_capabilities "
                                        "VK_KHR_get_physical_device_properties2", runtime, false);
+    // with the semaphore guard (not on Meta's runtime): the driver's own messages, logged
+    // by WatchVulkanMessages (Mesa explains its errors there and nowhere else)
+    if (g.semaphoreGuard && SupportedVulkanExtensions(false).count("VK_EXT_debug_utils")) list += " VK_EXT_debug_utils";
     LOG("Vulkan instance extensions: %s", list.c_str());
     return WriteExtensions(list, names, size);
 }
 
 EXPORT int32_t vrapi_GetDeviceExtensionsVulkan(char* names, uint32_t* size) {
+    if (g.semaphoreGuard) InstallVulkanHooks("device extensions asked for", true);   // before Echo creates its device
     std::string runtime;
     uint32_t n = 0;
     if (g.getDeviceExts && XR_SUCCEEDED(g.getDeviceExts(g.instance, g.system, 0, &n, nullptr)) && n) {
@@ -1049,7 +2211,14 @@ EXPORT int32_t vrapi_CreateSystemVulkan(vr::SystemCreateInfoVulkan* info) {
     vkGetPhysicalDeviceQueueFamilyProperties(g.vkPhysical, &n, fam.data());
     for (uint32_t i = 0; i < n; ++i)
         if (fam[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) { g.queueFamily = i; break; }
-    return CreateSession() ? vr::kSuccess : vr::kErrorInvalidParameter;
+    if (g.semaphoreGuard) {
+        WatchVulkanMessages();
+        InstallVulkanHooks("system created");
+        TestSubmit("before the OpenXR session");
+    }
+    bool ok = CreateSession();
+    if (g.semaphoreGuard) TestSubmit("after the OpenXR session");
+    return ok ? vr::kSuccess : vr::kErrorInvalidParameter;
 }
 
 EXPORT void vrapi_DestroySystemVulkan() {}
@@ -1072,6 +2241,17 @@ EXPORT void* vrapi_CreateTextureSwapChain3(int32_t type, int64_t format, int32_t
     auto* s = new Swapchain;
     XrSwapchainCreateInfo ci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
     ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    if (g.flipCopy) {   // the copy needs blits both ways in Echo's format
+        VkFormatProperties fp{};
+        vkGetPhysicalDeviceFormatProperties(g.vkPhysical, (VkFormat)format, &fp);
+        const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+        if ((fp.optimalTilingFeatures & need) != need) {
+            g.flipCopy = false;
+            LOGE("flip copy: format %lld can't be blitted, flipping by fov instead", (long long)format);
+        } else {
+            ci.usageFlags |= XR_SWAPCHAIN_USAGE_TRANSFER_SRC_BIT;
+        }
+    }
     ci.format = format;   // a VkFormat (43 = VK_FORMAT_R8G8B8A8_SRGB)
     ci.sampleCount = 1;
     ci.width = (uint32_t)width;
@@ -1087,10 +2267,23 @@ EXPORT void* vrapi_CreateTextureSwapChain3(int32_t type, int64_t format, int32_t
     s->width = width;
     s->height = height;
     s->arraySize = (int32_t)ci.arraySize;
+    if (g.flipCopy) {   // what's shown: Echo's images copied in upside down
+        XrSwapchainCreateInfo oi = ci;
+        oi.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+        oi.mipCount = 1;
+        if (Ok(xrCreateSwapchain(g.session, &oi, &s->out), "xrCreateSwapchain (flip copy)")) {
+            uint32_t m = 0;
+            xrEnumerateSwapchainImages(s->out, 0, &m, nullptr);
+            s->outImages.assign(m, { XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR });
+            xrEnumerateSwapchainImages(s->out, m, &m, reinterpret_cast<XrSwapchainImageBaseHeader*>(s->outImages.data()));
+        } else {
+            s->out = XR_NULL_HANDLE;
+        }
+    }
     CreateFoveationMaps(s);
     g.swapchains.push_back(s);
-    LOG("swapchain %p: %dx%d x%d, format %lld, %u images (Echo asked for %d)", (void*)s, width, height, s->arraySize,
-        (long long)format, n, bufferCount);
+    LOG("swapchain %p: %dx%d x%d, format %lld, %u images (Echo asked for %d), flipped %s", (void*)s, width, height,
+        s->arraySize, (long long)format, n, bufferCount, !g.flipY ? "not at all" : s->out ? "by copy" : "by fov");
     return s;
 }
 
@@ -1098,6 +2291,7 @@ EXPORT void vrapi_DestroyTextureSwapChain(void* chain) {
     Swapchain* s = FindSwapchain(chain);
     if (!s) return;
     DestroyFoveationMaps(s);
+    if (s->out) xrDestroySwapchain(s->out);
     xrDestroySwapchain(s->handle);
     g.swapchains.erase(std::find(g.swapchains.begin(), g.swapchains.end(), s));
     delete s;
@@ -1152,6 +2346,14 @@ EXPORT void vrapi_LeaveVrMode(void*) {
 }
 
 EXPORT int32_t vrapi_PollEvent(vr::EventHeader* event) {
+    static bool guardChecked = false;   // Echo's first frame: table entries filled since CreateSystemVulkan
+    if (!guardChecked) {
+        guardChecked = true;
+        if (g.semaphoreGuard) InstallVulkanHooks("first frame");
+        g_firstFrame.store(true);
+    }
+    g_echoTid.store((pid_t)syscall(SYS_gettid));
+    g_lastPoll.store(Now());
     PumpEvents();
     if (!event) return vr::kErrorInvalidParameter;
     if (g.events.empty()) { event->EventType = vr::kEventNone; return vr::kSuccess; }
@@ -1177,7 +2379,11 @@ EXPORT int32_t vrapi_WaitFrame(void* ovr, int64_t frameIndex) {
     if (!g.running) { usleep((useconds_t)(g.period * 1e6)); return vr::kSuccess; }   // paused: don't spin
     if (g.waited && !g.begun) LOGE("frame %lld: waited twice", (long long)frameIndex);
     g.frame = { XR_TYPE_FRAME_STATE };
+    double waitStart = Now();
     if (!Ok(xrWaitFrame(g.session, nullptr, &g.frame), "xrWaitFrame")) return vr::kSuccess;
+    CalibrateClock(g.frame.predictedDisplayTime);
+    g.waitedAt = Now();
+    g.timeInWait += g.waitedAt - waitStart;
     g.waited = true;
     g.waitedIndex = (uint64_t)frameIndex;
     g.waitedTime = ToSeconds(g.frame.predictedDisplayTime);
@@ -1190,6 +2396,7 @@ EXPORT int32_t vrapi_BeginFrame(void* ovr, int64_t frameIndex) {
     if (!g.running || !g.waited || g.begun) return vr::kSuccess;
     if (!Ok(xrBeginFrame(g.session, nullptr), "xrBeginFrame")) return vr::kSuccess;
     g.begun = true;
+    GpuFrameStart(g.submitted);
     // Echo picks its image itself, round-robin; OpenXR hands images out in its own
     // round-robin. Both go the same way, so if they're out of step (after a pause), hand
     // the image straight back and take the next until it's the one Echo will draw into.
@@ -1208,6 +2415,15 @@ EXPORT int32_t vrapi_BeginFrame(void* ovr, int64_t frameIndex) {
             xrReleaseSwapchainImage(s->handle, &ri);
             s->acquired = -1;
         }
+        if (s->out) {   // flip copy: the image this frame is copied into
+            uint32_t idx = 0;
+            if (Ok(xrAcquireSwapchainImage(s->out, nullptr, &idx), "xrAcquireSwapchainImage (flip copy)")) {
+                XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+                wi.timeout = XR_INFINITE_DURATION;
+                Ok(xrWaitSwapchainImage(s->out, &wi), "xrWaitSwapchainImage (flip copy)");
+                s->outAcquired = (int32_t)idx;
+            }
+        }
     }
     return vr::kSuccess;
 }
@@ -1219,7 +2435,10 @@ EXPORT vr::Tracking2 vrapi_GetPredictedTracking2(void*, double seconds) {
     XrViewState vs{XR_TYPE_VIEW_STATE};
     uint32_t n = 0;
     bool ok = false;
-    if (g.session) {
+    if (!g.running) {   // as Locate: nothing to locate before the session runs
+        static bool logged = false;
+        if (!logged) { logged = true; LOG("tracking asked for before the session runs: default views until then"); }
+    } else {
         XrViewLocateInfo li{XR_TYPE_VIEW_LOCATE_INFO};
         li.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
         li.displayTime = ToXrTime(seconds);
@@ -1235,17 +2454,26 @@ EXPORT vr::Tracking2 vrapi_GetPredictedTracking2(void*, double seconds) {
         out.Eye[eye].ProjectionMatrix = Projection(views[eye].fov);
         out.Eye[eye].ViewMatrix = ViewMatrix(views[eye].pose);
     }
+    // where the eyes' centre is from the head, for the log (0 on Quest and on Steam Frame)
+    vr::Vector3f fromHead{};
+    if (ok) {
+        const vr::Posef& h = out.HeadPose.Pose;
+        fromHead = InHeadAxes(h.Orientation, { (views[0].pose.position.x + views[1].pose.position.x) * 0.5f - h.Position.x,
+                                               (views[0].pose.position.y + views[1].pose.position.y) * 0.5f - h.Position.y,
+                                               (views[0].pose.position.z + views[1].pose.position.z) * 0.5f - h.Position.z });
+    }
     static double nextLog = 0;
     if (Now() >= nextLog) {
         nextLog = Now() + 30;
         const vr::Posef& h = out.HeadPose.Pose;
-        LOG("tracking at %+.3fs: views %s (flags %llx), head status %x pos %.2f %.2f %.2f rot %.2f %.2f %.2f %.2f, eye0 fov %.2f/%.2f/%.2f/%.2f",
+        LOG("tracking at %+.3fs: views %s (flags %llx), head status %x pos %.2f %.2f %.2f rot %.2f %.2f %.2f %.2f, eye0 fov %.2f/%.2f/%.2f/%.2f, eyes turned %.1f/%.1f deg from the head, eyes' centre %.3f %.3f %.3f m from OpenXR's head (right/up/back)",
             seconds - Now(), ok ? "ok" : "FAILED", (unsigned long long)vs.viewStateFlags, out.Status, h.Position.x, h.Position.y,
             h.Position.z, h.Orientation.x, h.Orientation.y, h.Orientation.z, h.Orientation.w, views[0].fov.angleLeft,
-            views[0].fov.angleRight, views[0].fov.angleUp, views[0].fov.angleDown);
+            views[0].fov.angleRight, views[0].fov.angleUp, views[0].fov.angleDown, TurnDegrees(h.Orientation, views[0].pose.orientation),
+            TurnDegrees(h.Orientation, views[1].pose.orientation), fromHead.x, fromHead.y, fromHead.z);
     }
     ViewCache& c = g.cache[g.cacheNext];
-    g.cacheNext = (g.cacheNext + 1) % 16;
+    g.cacheNext = (g.cacheNext + 1) % 256;
     c.time = seconds;
     c.views[0] = views[0];
     c.views[1] = views[1];
@@ -1281,8 +2509,22 @@ EXPORT int32_t vrapi_SubmitFrame2(void*, const vr::SubmitFrameDescription2* desc
             XrCompositionLayerProjectionView v{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
             v.pose = c->views[eye].pose;
             v.fov = c->views[eye].fov;
-            if (g.flipY) std::swap(v.fov.angleUp, v.fov.angleDown);   // rows run bottom-up
-            v.subImage.swapchain = s->handle;
+            // the field of view Echo really rendered with: on Steam Frame it isn't OpenXR's
+            // (Echo takes itself for a Quest 2), and the compositor stretched the image to
+            // OpenXR's: the world grew and shrank as the head turned and the HUD sat too high
+            XrFovf rendered;
+            if (g.useEchoFov && FovFromTanAngles(l->Textures[eye].TexCoordsFromTanAngles, l->Textures[eye].TextureRect, rendered)) {
+                static int logged = 0;
+                if (logged < 2 || (g.submitted % 7200 == 0 && logged < 20)) {
+                    ++logged;
+                    LOG("eye %d: Echo rendered with fov %.2f/%.2f/%.2f/%.2f, OpenXR's view is %.2f/%.2f/%.2f/%.2f (left/right/up/down)",
+                        eye, rendered.angleLeft, rendered.angleRight, rendered.angleUp, rendered.angleDown, v.fov.angleLeft,
+                        v.fov.angleRight, v.fov.angleUp, v.fov.angleDown);
+                }
+                v.fov = rendered;
+            }
+            if (g.flipY && !s->out) std::swap(v.fov.angleUp, v.fov.angleDown);   // rows run bottom-up
+            v.subImage.swapchain = s->out ? s->out : s->handle;   // flip copy: the upside-down copy
             v.subImage.imageRect = { { (int32_t)(r[0] * s->width), (int32_t)(r[1] * s->height) },
                                      { (int32_t)(r[2] * s->width), (int32_t)(r[3] * s->height) } };
             v.subImage.imageArrayIndex = s->arraySize > 1 ? (uint32_t)eye : 0;
@@ -1299,9 +2541,14 @@ EXPORT int32_t vrapi_SubmitFrame2(void*, const vr::SubmitFrameDescription2* desc
         if (s->acquired >= 0) {
             if (g.testRed) PaintRed(s);
             if (g.testProbe && g.submitted % 72 == 0) Probe(s);
+            if (s->out) FlipCopy(s);
             XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
             Ok(xrReleaseSwapchainImage(s->handle, &ri), "xrReleaseSwapchainImage");
             s->acquired = -1;
+            if (s->outAcquired >= 0) {
+                Ok(xrReleaseSwapchainImage(s->out, &ri), "xrReleaseSwapchainImage (flip copy)");
+                s->outAcquired = -1;
+            }
         }
     std::vector<const XrCompositionLayerBaseHeader*> layers;
     if (g.frame.shouldRender)
@@ -1312,10 +2559,24 @@ EXPORT int32_t vrapi_SubmitFrame2(void*, const vr::SubmitFrameDescription2* desc
     ei.layerCount = (uint32_t)layers.size();
     ei.layers = layers.data();
     Ok(xrEndFrame(g.session, &ei), "xrEndFrame");
+    g.timeInFrame += Now() - g.waitedAt;
+    g.latency += ToSeconds(g.frame.predictedDisplayTime) - Now();
+    GpuFrameCollect(g.submitted);
     g.begun = g.waited = false;
-    if (++g.submitted == 1 || g.submitted % 720 == 0)
+    if (++g.submitted == 1 || g.submitted % 720 == 0) {
         LOG("frame %llu submitted (%zu layer(s), %.0f Hz, image mismatches so far %llu)", (unsigned long long)g.submitted,
             layers.size(), 1.0 / g.period, (unsigned long long)(g.swapchains.empty() ? 0 : g.swapchains[0]->mismatches));
+        double n = g.submitted == 1 ? 1 : 720;
+        double wall = Now() - g.timingSince;
+        LOG("frame timing: %.1f frames/s; per frame %.1f ms waiting in xrWaitFrame, %.1f ms from there to xrEndFrame (Echo), "
+            "display %.1f ms after xrEndFrame; GPU %.1f ms per frame (%d measured; 13.9 ms is 72 Hz); GPU timer reads that would have waited: %d",
+            g.timingSince > 0 ? n / wall : 0.0, g.timeInWait / n * 1000, g.timeInFrame / n * 1000, g.latency / n * 1000,
+            g.gpuCount ? g.gpuSum / g.gpuCount : 0.0, g.gpuCount, g_timerWaitsSkipped.exchange(0));
+        g.timeInWait = g.timeInFrame = g.latency = 0;
+        g.gpuSum = 0;
+        g.gpuCount = 0;
+        g.timingSince = Now();
+    }
     return vr::kSuccess;
 }
 

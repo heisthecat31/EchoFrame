@@ -11,6 +11,10 @@ The changes (changes() below; runtime/build.py makes the same ones):
   libr15.so, libassetpatch.so       Steam Frame build only (--frame): the game data path
                                     becomes Echo's private folder (relocate()), and
                                     the Vulkan fixes for its driver (frame_code())
+  libovrplatformloader.so           Steam Frame build only: replaced by EchoQuestXR's
+                                    stand-in for Meta's Platform SDK, which isn't on the
+                                    Frame (Meta's loader aborts Echo when it finds no
+                                    Platform SDK service)
 Everything else in the APK is copied unchanged.
 
 The result is signed with your own random key (RSA-2048, self-signed), made the first time
@@ -43,6 +47,10 @@ import axml  # noqa: E402
 HERE = os.path.dirname(os.path.abspath(__file__))
 LIB = "lib/arm64-v8a/"
 RUNTIME_FILES = ("libvrapi.so", "libopenxr_loader.so")
+# Steam Frame build only (runtime/ovrplatform_standin.c): Meta's libovrplatformloader.so needs
+# Horizon OS's Platform SDK service; without it, it throws and Echo aborts as it starts its
+# OVR provider ("Failed to launch SystemActivities").
+FRAME_RUNTIME_FILES = ("libovrplatformloader.so",)
 # Meta's VrApi loader 1.1.40 as shipped in Echo VR build 4987566
 META_VRAPI_SHA256 = "43bec081aae29781389823f690b5f63932905f76cb96452474a65ef8c16fd3e6"
 SIGNATURE_FILES = (".SF", ".RSA", ".DSA", ".EC")
@@ -79,6 +87,17 @@ FRAME_CODE_PATCHES = [
     ("gives Echo's uploader the render queue when the driver has only one",
      "e8274091" "08010b91" "158560f9" "e8031faa" "7f060031" "b5af05f9" "c0010054", 12, "e80315aa"),
 ]
+# The same, in Echo's OVR provider (libpnsovr.so). Echo's voice chat reads the microphone once
+# per game update (CR15NetVoipBroadcasterCS::UpdateRecord), at most MicAvailable() samples, and
+# MicAvailable always says 960 (20 ms at 48 kHz). At 72 updates a second that's plenty; the
+# Frame ran Echo at 36, where 960 an update takes in 34,560 of the microphone's 48,000 samples a
+# second, and the rest was lost: the voice cut out. MicAvailable now says 2880, so each update
+# takes in what has built up (ovr_Microphone_GetPCM returns only what's there). Matched with
+# MicStop, the function before it, as `mov w0, #960; ret` is also MicCaptureSize.
+FRAME_PNSOVR_PATCHES = [
+    ("Echo reads all the microphone has captured each update (MicAvailable 960 -> 2880)",
+     "282800f0" "001d42f9" "727cfe17" "00788052" "c0035fd6", 12, "00688152"),
+]
 
 
 class PatchError(Exception):
@@ -88,10 +107,10 @@ class PatchError(Exception):
 def find_runtime():
     """The runtime libraries: patcher/runtime/ (release layout) or ../build/ (built from source)."""
     for d in (os.path.join(HERE, "runtime"), os.path.join(HERE, "..", "build")):
-        if all(os.path.isfile(os.path.join(d, f)) for f in RUNTIME_FILES):
+        if all(os.path.isfile(os.path.join(d, f)) for f in RUNTIME_FILES + FRAME_RUNTIME_FILES):
             return os.path.abspath(d)
-    raise PatchError("The EchoQuestXR runtime isn't here. Put libvrapi.so and libopenxr_loader.so in "
-                     "patcher/runtime/, or build them: python runtime/build.py --lib-only")
+    raise PatchError("The EchoQuestXR runtime isn't here. Put " + ", ".join(RUNTIME_FILES + FRAME_RUNTIME_FILES) +
+                     " in patcher/runtime/, or build them: python runtime/build.py --lib-only")
 
 
 def inspect(apk):
@@ -205,29 +224,34 @@ def relocate(data, new_dir):
     return bytes(data), count
 
 
-def frame_code(data, log=print):
-    """libr15.so with FRAME_CODE_PATCHES applied."""
+def frame_code(data, log=print, patches=None, lib="libr15.so"):
+    """A library with code patches applied (FRAME_CODE_PATCHES for libr15.so)."""
     data = bytearray(data)
-    for what, find, at, new in FRAME_CODE_PATCHES:
+    for what, find, at, new in (FRAME_CODE_PATCHES if patches is None else patches):
         find, new = bytes.fromhex(find), bytes.fromhex(new)
         i = data.find(find)
         if i < 0 or data.find(find, i + 1) >= 0:
-            raise PatchError(f"Couldn't find the code to change in libr15.so ({what}); "
+            raise PatchError(f"Couldn't find the code to change in {lib} ({what}); "
                              "the Steam Frame build is made for Echo VR build 4987566")
         data[i + at:i + at + len(new)] = new
-        log(f"  libr15.so: {what}")
+        log(f"  {lib}: {what}")
     return bytes(data)
 
 
 def changes(apk, runtime, log=print, data_dir=None, frame_fixes=False):
     """{entry name: new bytes}: every change EchoQuestXR makes to an Echo VR APK. data_dir:
     where Echo reads its game data instead of /sdcard/Android/media/<package>; frame_fixes:
-    FRAME_CODE_PATCHES. The Steam Frame build does both (FRAME_DATA_DIR)."""
-    out = {LIB + f: open(os.path.join(runtime, f), "rb").read() for f in RUNTIME_FILES}
+    FRAME_CODE_PATCHES and FRAME_RUNTIME_FILES. The Steam Frame build does both (FRAME_DATA_DIR)."""
+    files = RUNTIME_FILES + (FRAME_RUNTIME_FILES if frame_fixes else ())
+    out = {LIB + f: open(os.path.join(runtime, f), "rb").read() for f in files}
     with zipfile.ZipFile(apk) as z:
         out["AndroidManifest.xml"] = axml.patch_manifest(z.read("AndroidManifest.xml"), log)
         if frame_fixes:
             out[LIB + "libr15.so"] = frame_code(z.read(LIB + "libr15.so"), log)
+            if LIB + "libpnsovr.so" in z.namelist():
+                out[LIB + "libpnsovr.so"] = frame_code(z.read(LIB + "libpnsovr.so"), log, FRAME_PNSOVR_PATCHES,
+                                                       "libpnsovr.so")
+            log("  libovrplatformloader.so: EchoQuestXR's Platform SDK stand-in (Meta's needs Horizon OS)")
         if data_dir:
             names = set(z.namelist())
             total = 0
@@ -243,7 +267,7 @@ def changes(apk, runtime, log=print, data_dir=None, frame_fixes=False):
 
 def patch(apk, out, log=print, data_dir=None, frame=False):
     """frame: the Steam Frame build (game data in FRAME_DATA_DIR unless data_dir says otherwise,
-    Vulkan 1.0)."""
+    the Vulkan fixes, the Platform SDK stand-in)."""
     log(f"Reading {apk}")
     log(f"  {inspect(apk)}")
     runtime = find_runtime()
@@ -315,7 +339,8 @@ def main():
     ap.add_argument("apk")
     ap.add_argument("-o", "--out")
     ap.add_argument("--frame", action="store_true",
-                    help=f"Steam Frame build: game data in {FRAME_DATA_DIR}, Vulkan fixes for its driver")
+                    help=f"Steam Frame build: game data in {FRAME_DATA_DIR}, Vulkan fixes for its driver, "
+                         "Platform SDK stand-in")
     ap.add_argument("--data-dir", help="game data folder to use instead (testing)")
     a = ap.parse_args()
     out = a.out or os.path.splitext(a.apk)[0] + ("_openxr_frame.apk" if a.frame else "_openxr.apk")

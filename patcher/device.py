@@ -185,7 +185,7 @@ PROBE_STEAMOS = "; ".join([
 
 
 class Frame:
-    """A Steam Frame seen through its SteamOS adb: Echo set up by Frame Control as its own
+    """A Steam Frame seen through its SteamOS adb: Echo set up (by the patcher, frame_setup.py, or Frame Control) as its own
     Lepton instance (~/Applications/Android/<package>: app.apk, instance.id, shortcut.id).
     `data` is Echo's private folder, /data/data/<package> inside Lepton, which survives
     restarts and APK updates; when /sdcard has no game data, EchoQuestXR's libvrapi points
@@ -200,7 +200,7 @@ class Frame:
 
 
 def frame_info(adb, serial):
-    """A Frame for a Steam Frame's SteamOS adb (instance None if Frame Control hasn't set Echo
+    """A Frame for a Steam Frame's SteamOS adb (instance None if Echo isn't set
     up), None for an Android headset."""
     code, out = shell(adb, serial, "grep -q '^ID=steamos' /etc/os-release 2>/dev/null && echo FRAME $HOME "
                       f"$(cat {LEPTON}/{PACKAGE}/instance.id 2>/dev/null || echo -) "
@@ -210,6 +210,13 @@ def frame_info(adb, serial):
         return None
     num = lambda s: s if s.isdigit() else None
     return Frame(parts[1], num(parts[2]), num(parts[3]))
+
+
+def frame_ready(adb, serial, fr):
+    """Echo's launcher, Lepton and Echo's data folder are all on this Frame."""
+    code, out = shell(adb, serial, f"[ -x '{fr.app_dir}/launch.sh' ] && [ -x $HOME/.local/share/Steam/steamapps/common/"
+                                   f"Lepton/lepton ] && podman unshare test -d '{fr.data}' && echo ready", timeout=30)
+    return "ready" in out
 
 
 def tool(adb, serial, name, *args, timeout=60):
@@ -226,14 +233,19 @@ def installed(adb, serial):
     return f"package:{PACKAGE}" in out.split()
 
 
-def install(adb, serial, apk):
+def install(adb, serial, apk, say=lambda f, t: None, log=print):
     """('ok' | 'signature' | 'error', message). 'signature': a copy signed with another key
-    is installed, so it has to be uninstalled first (the caller asks the player)."""
+    is installed, so it has to be uninstalled first (the caller asks the player).
+    say(fraction or None, text): progress while a Steam Frame is set up."""
     fr = frame_info(adb, serial)
+    if fr and not (fr.instance and fr.shortcut and frame_ready(adb, serial, fr)):
+        import frame_setup   # first time on this Frame: Lepton, launcher, Steam shortcut, data folder
+        try:
+            frame_setup.set_up(adb, serial, apk, say, log)
+        except IOError as e:
+            return "error", str(e)
+        return "ok", "Installed. Press Launch: it restarts Echo so Lepton uses the new APK."
     if fr:   # Steam Frame: Lepton runs ~/Applications/Android/<package>/app.apk; it rebuilds on change
-        if not fr.instance:
-            return "error", ("Echo VR isn't set up on this Frame yet: send the patched APK with Frame Control "
-                             "once (that makes its Steam shortcut), then Install here.")
         part = f"{fr.app_dir}/app.apk.part"
         code, out = run(adb, "-s", serial, "push", apk, part, timeout=900)
         if code == 0:
@@ -289,6 +301,13 @@ LOG_SCRIPT = "; ".join([
     "else echo '=== Echo VR is not running: the last 4000 lines of everything'; logcat -d -v time -t 4000; fi",
     "echo '=== crash log'", "logcat -d -v time -b crash",
     "echo '=== EchoQuestXR and OpenXR, all processes'", "logcat -d -v time " + " ".join(f"'{t}'" for t in LOG_TAGS),
+    # if Echo hangs (no picture, "Deadlock detected!"): where each of its threads is, and
+    # whether Android resumed its activity and gave it a window. Needs root (Lepton's
+    # container); a Quest's shell gets "permission denied" here.
+    "if [ -n \"$P\" ]; then echo '=== Echo activity and window'; "
+    "dumpsys activity activities 2>&1 | grep -iE 'readyatdawn|mResumed|ResumedActivity' | head -20; "
+    "dumpsys window windows 2>&1 | grep -iE 'readyatdawn|mCurrentFocus|mFocusedApp' | head -20; "
+    "echo '=== Echo threads (debuggerd -b)'; debuggerd -b $P 2>&1 | head -3000; fi",
 ])
 
 
@@ -299,12 +318,39 @@ FRAME_KEPT_LOGS = "; ".join([
     f"D=$S/steamapps/compatdata/$ID/internal/{PACKAGE}",
     "echo '=== Lepton logcats'", "ls -lt $S/logs/lepton-logcats 2>&1 | head -10",
     "for f in $(find $S/logs/lepton-logcats -type f -printf '%T@ %p\\n' 2>/dev/null | sort -rn | head -2 | cut -d' ' -f2-); "
-    "do echo \"=== $f\"; tail -c 800000 \"$f\"; echo; done",
+    # Echo's, the runtime's and the driver's lines first (the whole run), then the unfiltered end
+    "do echo \"=== $f (Echo, EchoQuestXR, Vulkan and crash lines)\"; "
+    "grep -a -E 'EchoQuestXR|RAD |RAD:|vulkan|MESA|Fossilize|fdm|AssetPatch|OpenXR|DEBUG|libc|AndroidRuntime' \"$f\" "
+    "| tail -c 3000000; echo \"=== $f (the end, unfiltered)\"; tail -c 300000 \"$f\"; echo; done",
     "echo \"=== lepton-steamlaunch-$ID.log\"", "tail -c 200000 $S/logs/lepton-steamlaunch-$ID.log 2>&1",
     "echo; echo '=== Echo crash dumps'", "podman unshare ls -la $D/files/_temp/crashes 2>&1 | head -20",
     "echo '=== journal: Echo, its SteamVR client, crashes'",
     "(journalctl -n 6000 --no-pager -o short-precise 2>/dev/null; journalctl --user -n 6000 --no-pager -o short-precise "
     "2>/dev/null) | grep -E 'readyatdawn|coredump|xrclient|lepton' | grep -vE 'steamvr_logs_to_journald|podman\\[' | tail -200",
+])
+
+# Steam Frame: SteamVR's own logs, for how it paces Echo's frames (it ran Echo at half rate,
+# 36 Hz, with the GPU taking under 2 ms a frame): the end of the compositor's log, and the
+# server's lines about timing, throttling, reprojection and the refresh rate. Runs on SteamOS.
+FRAME_STEAMVR_LOGS = "; ".join([
+    "L=$HOME/.local/share/Steam/logs",
+    "echo '=== SteamVR compositor (vrcompositor.txt, the end)'", "tail -n 500 $L/vrcompositor.txt 2>&1",
+    "echo '=== SteamVR server (vrserver.txt: timing, throttling, reprojection, refresh rate, Echo)'",
+    "tail -n 6000 $L/vrserver.txt 2>/dev/null | grep -aiE 'throttl|reproject|motion smooth|refresh|hz|frame ?tim|"
+    "late|dropped|readyatdawn|lepton|prediction' | tail -n 200",
+    "echo '=== SteamVR client log for Echo (xrclient_com.readyatdawn.r15.txt, the end)'",
+    "tail -n 300 $L/xrclient_com.readyatdawn.r15.txt 2>&1",
+    "echo '=== SteamVR settings: throttling, motion smoothing, refresh, per-app'",
+    "grep -aiE 'throttl|motionSmooth|reproject|refresh|framesTo|prediction|readyatdawn|lepton|preferredRefresh|"
+    "allowSupersample|supersample|steam.app|\"apps\"' $HOME/.config/openvr/config/steamvr.vrsettings $HOME/.local/share/Steam/config/steamvr.vrsettings 2>&1 | head -60",
+    "echo '=== vrclient.so (SteamVR in Lepton): its strings about frame timing, fences, environment'",
+    "V=$(ls /opt/steamvr/bin/androidarm64/vrclient.so $HOME/.local/share/Steam/steamapps/common/SteamVR/bin/androidarm64/"
+    "vrclient.so 2>/dev/null | head -1); echo \"$V\"; [ -n \"$V\" ] && grep -a -o -E '[A-Za-z_][A-Za-z0-9_ %:.,()/-]{5,90}' \"$V\" "
+    "| grep -iE 'throttl|timeline|semaphore|gpu fence|fence|frame ?tim|vsync|interval|prediction|Disable[A-Z]|Enable[A-Z]|"
+    "Force[A-Z]|refresh|reproject|late|half|halv|LEPTON|getenv' | sort -u | head -150",
+    "echo '=== SteamOS microphone (default source, volume)'",
+    "(export XDG_RUNTIME_DIR=/run/user/$(id -u); pactl get-default-source; pactl get-source-volume @DEFAULT_SOURCE@) 2>&1",
+    "echo '=== SteamVR logs present'", "ls -lt $L 2>&1 | head -25",
 ])
 
 # Steam Frame: Echo's newest crash dump: its name, then the file in base64 (the Frame's adb
@@ -361,6 +407,9 @@ def save_logs(adb, serial, path):
             out, android = ("(Echo's Lepton container isn't running: the logs Lepton and Steam kept)\n"
                             + kept.replace("\0", "")), True
             out += "\n=== Echo's newest crash dump\n" + "\n".join(frame_crash_dump(adb, serial, path)) + "\n"
+        code, steamvr = shell(adb, serial, FRAME_STEAMVR_LOGS, timeout=60)   # why SteamVR paces Echo as it does
+        out += "\n" + steamvr.replace("\0", "")
+        out += "\n=== SteamVR throttle settings (vrcmd)\n" + frame_steamvr_throttle(adb, serial, set_it=False) + "\n"
     if not android:
         first = out.strip().splitlines()[-1] if out.strip() else "no output"
         code, diag = run(adb, "-s", serial, "shell", PROBE, timeout=90)
@@ -418,6 +467,14 @@ def shell(adb, serial, cmd, timeout=60):
     return run(adb, "-s", serial, "shell", cmd, timeout=timeout)
 
 
+def shell_stream(adb, serial, cmd):
+    """adb shell cmd as a running process (stdout and stderr together, line by line), for the
+    Advanced terminal; no input, so interactive commands won't work."""
+    return subprocess.Popen([adb, "-s", serial, "shell", cmd], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace", bufsize=1,
+                            creationflags=NO_WINDOW)
+
+
 def push(adb, serial, local, remote, progress=None):
     """adb push one file, reporting progress(bytes on the headset) about once a second. Gives
     up if nothing arrives for two minutes."""
@@ -455,8 +512,8 @@ class Storage:
         self.frame = frame_info(adb, serial)
         if self.frame:
             if not self.frame.instance:
-                raise IOError("Echo VR isn't set up on this Frame yet: send the patched APK with Frame Control "
-                              "once, then Install here.")
+                raise IOError("Echo VR isn't set up on this Frame yet: press Install (with the APK from step 3) "
+                              "and the patcher sets it up.")
             self.base, self.stage = self.frame.data, self.frame.stage
         else:
             self.base, self.stage = MEDIA, f"{MEDIA}/files/.echoquestxr-copy"
@@ -471,8 +528,8 @@ class Storage:
         if self.frame:
             code, out = self.sh(f"test -d '{self.base}' && echo ok")
             if "ok" not in out:
-                raise IOError("Echo hasn't made its data folder on this Frame yet: start Echo once from the Steam "
-                              "library (it closes without game data; that's fine), then Install again.")
+                raise IOError("Echo hasn't made its data folder on this Frame yet: press Install with the APK from "
+                              "step 3 and the patcher starts Echo once to make it.")
             code, out = shell(self.adb, self.serial, f"mkdir -p '{self.stage}' && echo writable")
         else:
             code, out = self.sh(f"mkdir -p '{self.stage}' && echo writable")
@@ -523,6 +580,108 @@ class Storage:
             shell(self.adb, self.serial, f"rm -rf '{self.stage}'")
         else:
             self.sh(f"rm -rf '{self.stage}'")
+
+
+BUTTONS_FILE = "files/echoquestxr-buttons.txt"   # Steam Frame button layout, read when Echo starts
+
+
+def read_buttons(adb, serial):
+    """The button layout file's text on the headset ('' if there's none)."""
+    store = Storage(adb, serial)
+    code, out = store.sh(f"cat '{store.base}/{BUTTONS_FILE}' 2>/dev/null")
+    return out
+
+
+def write_buttons(adb, serial, text):
+    """Writes the button layout file (buttons.to_text); Echo uses it the next time it starts."""
+    import tempfile
+    store = Storage(adb, serial)
+    store.check_writable()
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, newline="\n") as f:
+        f.write(text)
+        local = f.name
+    try:
+        store.put(local, BUTTONS_FILE)
+    finally:
+        os.remove(local)
+    store.done()
+    if store.frame:
+        settings = dict(line.partition("=")[::2] for line in text.split() if "=" in line)
+        # Sync=skip: SteamVR's client is told not to wait on the frame's GPU semaphore
+        env = {"DisableTimelineSemaphoreWait": "1"} if settings.get("Sync") == "skip" else {}
+        frame_launch_env(adb, serial, store.frame, env)
+        if settings.get("Mic", "keep") != "keep":
+            frame_mic_volume(adb, serial, settings["Mic"])
+        return frame_steamvr_throttle(adb, serial, set_it=True)   # Echo's own SteamVR throttle: 0
+    return ""
+
+
+# SteamVR's frame throttling for Echo. SteamVR ran Echo at half rate (36 Hz, every other frame
+# reprojected) from its first frame, whatever the GPU load: a throttle setting. SteamVR's client
+# (vrclient) reads framesToThrottle, and powersaveFramesToThrottle when the SteamOS power
+# profile is power-save, globally ("steamvr") and per app (Echo's app key, from SteamVR's log
+# for Echo). vrcmd changes them in the running SteamVR (IVRSettings). Runs on SteamOS.
+FRAME_ENV = "; ".join([   # also the Advanced terminal's set-up: $K is Echo's app key, $C is vrcmd
+    "export XDG_RUNTIME_DIR=/run/user/$(id -u)",
+    "K=$(grep -a -o 'App key after connect message:[^ ]*' $HOME/.local/share/Steam/logs/xrclient_com.readyatdawn.r15.txt "
+    "2>/dev/null | tail -1 | cut -d: -f2)",
+    "C=$(ls /opt/steamvr/bin/linuxarm64/vrcmd /opt/steamvr/bin/linux64/vrcmd "
+    "$HOME/.local/share/Steam/steamapps/common/SteamVR/bin/linuxarm64/vrcmd 2>/dev/null | head -1)",
+    "[ -n \"$C\" ] && export LD_LIBRARY_PATH=$(dirname \"$C\"):${LD_LIBRARY_PATH:-}",
+])
+FRAME_VRCMD = "; ".join([FRAME_ENV, "echo \"Echo's SteamVR app key: ${K:-unknown}; vrcmd: ${C:-not found}\""])
+# vrcmd takes "section.key" as one argument (and prints "section.key=value"); Echo's app key
+# has dots itself. Setting: "section.key=value", else "section.key" "value"; read back after.
+FRAME_VRCMD_READ = "; ".join([
+    "for k in framesToThrottle powersaveFramesToThrottle additionalFramesToPredict motionSmoothing; do "
+    "echo \"steamvr.$k: $(timeout 10 \"$C\" --settings-int steamvr.$k 2>&1 | tail -1)\"; done",
+    "[ -n \"$K\" ] && for k in framesToThrottle powersaveFramesToThrottle motionSmoothingOverride; do "
+    "echo \"$K.$k: $(timeout 10 \"$C\" --settings-int \"$K.$k\" 2>&1 | tail -1)\"; done",
+])
+# The Frame read steamvr.powersaveFramesToThrottle=1 (SteamOS's power-save profile: every other
+# frame, 36 of 72 Hz) and nothing per app: SteamVR has no per-app value for it. So it's set
+# globally to 0 (apps aren't throttled in power-save mode), and read back.
+FRAME_VRCMD_SET = "; ".join([
+    "[ -n \"$C\" ] && { echo \"set steamvr.powersaveFramesToThrottle=0: "
+    "$(timeout 10 \"$C\" --set-settings-int steamvr.powersaveFramesToThrottle=0 2>&1 | tail -1)\"; "
+    "case \"$(timeout 10 \"$C\" --settings-int steamvr.powersaveFramesToThrottle 2>&1 | tail -1)\" in *=0) ;; *) "
+    "echo \"set steamvr.powersaveFramesToThrottle 0: "
+    "$(timeout 10 \"$C\" --set-settings-int steamvr.powersaveFramesToThrottle 0 2>&1 | tail -1)\";; esac; }",
+])
+
+
+def frame_steamvr_throttle(adb, serial, set_it):
+    """SteamVR's throttle settings for Echo (read, and with set_it, Echo's own set to 0).
+    Returns what vrcmd answered, for the log."""
+    script = "; ".join([FRAME_VRCMD] + ([FRAME_VRCMD_SET] if set_it else []) + [FRAME_VRCMD_READ])
+    code, out = shell(adb, serial, script, timeout=90)
+    return out.strip()
+
+
+def frame_mic_volume(adb, serial, percent):
+    """SteamOS's default microphone input volume (PipeWire, through pactl), as the user steamos."""
+    code, out = shell(adb, serial, f"export XDG_RUNTIME_DIR=/run/user/$(id -u); "
+                                   f"pactl set-source-volume @DEFAULT_SOURCE@ {int(percent)}% && "
+                                   f"pactl get-source-volume @DEFAULT_SOURCE@", timeout=20)
+    if code != 0:
+        raise IOError(f"couldn't set the microphone level: {out.strip()}")
+
+
+def frame_launch_env(adb, serial, fr, env):
+    """Environment variables for Echo's Lepton launch on a Steam Frame, in a marked block of
+    Frame Control's launch.sh (Lepton passes vrclient's own variables, such as
+    DisableTimelineSemaphoreWait, on to the app). An empty env removes the block."""
+    lines = ["# >>> EchoQuestXR settings (written by the EchoQuestXR patcher)"]
+    lines += [f"export {k}={shlex.quote(v)}" for k, v in env.items()]
+    lines += ["# <<< EchoQuestXR settings"]
+    block = "\\n".join(lines) if env else ""
+    script = (f"F='{fr.app_dir}/launch.sh'; [ -f \"$F\" ] || {{ echo 'no launch.sh'; exit 0; }}; "
+              f"awk -v block={shlex.quote(block)} '/^# >>> EchoQuestXR/{{skip=1;next}} /^# <<< EchoQuestXR/{{skip=0;next}} "
+              "skip{next} {print} /^set -euo pipefail/ && block!=\"\" {print block}' \"$F\" > \"$F.eqx\" "
+              "&& chmod 755 \"$F.eqx\" && mv -f \"$F.eqx\" \"$F\" && grep -c EchoQuestXR \"$F\"")
+    code, out = shell(adb, serial, script, timeout=30)
+    if code != 0:
+        raise IOError(f"couldn't update Echo's launch.sh: {out.strip()}")
 
 
 def game_data_on_headset(adb, serial):
