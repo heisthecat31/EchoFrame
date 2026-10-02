@@ -1,6 +1,6 @@
 """EchoQuestXR patcher: turns your Echo VR Quest APK into one that runs on OpenXR.
 
-    python patch.py <echo.apk> [-o <out.apk>] [--frame]   (or use gui.pyw)
+    python patch.py <echo.apk> [-o <out.apk>] [--frame | --standin-mic]   (or use gui.pyw)
 
 The changes (changes() below; runtime/build.py makes the same ones):
   lib/arm64-v8a/libvrapi.so         replaced by the EchoQuestXR runtime (VrApi on OpenXR)
@@ -89,13 +89,14 @@ FRAME_CODE_PATCHES = [
 ]
 # The same, in Echo's OVR provider (libpnsovr.so). Echo's voice chat reads the microphone once
 # per game update (CR15NetVoipBroadcasterCS::UpdateRecord), at most MicAvailable() samples, and
-# MicAvailable always says 960 (20 ms at 48 kHz). At 72 updates a second that's plenty; the
-# Frame ran Echo at 36, where 960 an update takes in 34,560 of the microphone's 48,000 samples a
-# second, and the rest was lost: the voice cut out. MicAvailable now says 2880, so each update
-# takes in what has built up (ovr_Microphone_GetPCM returns only what's there). Matched with
+# encodes what it got as one Opus frame (libpnsrad's VoipEncode). MicAvailable always says 960
+# (20 ms at 48 kHz): at 72 updates a second that keeps up, but the Frame can run Echo slower,
+# and one 20 ms frame an update then can't keep up with the microphone. MicAvailable now says
+# 2880, and the Platform SDK stand-in's ovr_Microphone_GetPCM hands over whole Opus frames only
+# (20 ms, or 40 ms when Echo has fallen behind; see runtime/ovrplatform_standin.c). Matched with
 # MicStop, the function before it, as `mov w0, #960; ret` is also MicCaptureSize.
 FRAME_PNSOVR_PATCHES = [
-    ("Echo reads all the microphone has captured each update (MicAvailable 960 -> 2880)",
+    ("Echo can take a 40 ms Opus frame when it has fallen behind (MicAvailable 960 -> 2880)",
      "282800f0" "001d42f9" "727cfe17" "00788052" "c0035fd6", 12, "00688152"),
 ]
 
@@ -238,16 +239,20 @@ def frame_code(data, log=print, patches=None, lib="libr15.so"):
     return bytes(data)
 
 
-def changes(apk, runtime, log=print, data_dir=None, frame_fixes=False):
+def changes(apk, runtime, log=print, data_dir=None, frame_fixes=False, standin_mic=False):
     """{entry name: new bytes}: every change EchoQuestXR makes to an Echo VR APK. data_dir:
     where Echo reads its game data instead of /sdcard/Android/media/<package>; frame_fixes:
-    FRAME_CODE_PATCHES and FRAME_RUNTIME_FILES. The Steam Frame build does both (FRAME_DATA_DIR)."""
-    files = RUNTIME_FILES + (FRAME_RUNTIME_FILES if frame_fixes else ())
+    FRAME_CODE_PATCHES and FRAME_RUNTIME_FILES. The Steam Frame build does both (FRAME_DATA_DIR).
+    standin_mic (testing the Frame's microphone path on a Quest): only the Platform SDK stand-in
+    and FRAME_PNSOVR_PATCHES, so voice goes through the stand-in's microphone."""
+    standin = frame_fixes or standin_mic
+    files = RUNTIME_FILES + (FRAME_RUNTIME_FILES if standin else ())
     out = {LIB + f: open(os.path.join(runtime, f), "rb").read() for f in files}
     with zipfile.ZipFile(apk) as z:
         out["AndroidManifest.xml"] = axml.patch_manifest(z.read("AndroidManifest.xml"), log)
         if frame_fixes:
             out[LIB + "libr15.so"] = frame_code(z.read(LIB + "libr15.so"), log)
+        if standin:
             if LIB + "libpnsovr.so" in z.namelist():
                 out[LIB + "libpnsovr.so"] = frame_code(z.read(LIB + "libpnsovr.so"), log, FRAME_PNSOVR_PATCHES,
                                                        "libpnsovr.so")
@@ -265,15 +270,17 @@ def changes(apk, runtime, log=print, data_dir=None, frame_fixes=False):
     return out
 
 
-def patch(apk, out, log=print, data_dir=None, frame=False):
+def patch(apk, out, log=print, data_dir=None, frame=False, standin_mic=False):
     """frame: the Steam Frame build (game data in FRAME_DATA_DIR unless data_dir says otherwise,
-    the Vulkan fixes, the Platform SDK stand-in)."""
+    the Vulkan fixes, the Platform SDK stand-in). standin_mic: a Quest build with the Frame's
+    microphone path (the stand-in), for testing it on a Quest."""
     log(f"Reading {apk}")
     log(f"  {inspect(apk)}")
     runtime = find_runtime()
     log(f"Runtime: {runtime}")
     try:
-        replace = changes(apk, runtime, log, data_dir or (FRAME_DATA_DIR if frame else None), frame_fixes=frame)
+        replace = changes(apk, runtime, log, data_dir or (FRAME_DATA_DIR if frame else None), frame_fixes=frame,
+                          standin_mic=standin_mic)
     except axml.AxmlError as e:
         raise PatchError(f"Couldn't update AndroidManifest.xml: {e}")
 
@@ -342,10 +349,12 @@ def main():
                     help=f"Steam Frame build: game data in {FRAME_DATA_DIR}, Vulkan fixes for its driver, "
                          "Platform SDK stand-in")
     ap.add_argument("--data-dir", help="game data folder to use instead (testing)")
+    ap.add_argument("--standin-mic", action="store_true",
+                    help="Quest build with the Steam Frame's microphone path (Platform SDK stand-in), for testing")
     a = ap.parse_args()
     out = a.out or os.path.splitext(a.apk)[0] + ("_openxr_frame.apk" if a.frame else "_openxr.apk")
     try:
-        patch(a.apk, out, data_dir=a.data_dir, frame=a.frame)
+        patch(a.apk, out, data_dir=a.data_dir, frame=a.frame, standin_mic=a.standin_mic)
     except PatchError as e:
         sys.exit(f"error: {e}")
 

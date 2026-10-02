@@ -567,7 +567,10 @@ class Storage:
         part = f"{self.stage}/{os.path.basename(rel)}"
         push(self.adb, self.serial, local, part, progress)
         dest = f"{self.base}/{rel}"
-        own = f" && chown -R --reference='{self.base}' '{self.base}/{rel.split('/')[0]}'" if self.frame else ""
+        # only what this copy made (still root's, the container's user namespace being root here):
+        # a chown -R of the whole folder also re-owned Echo's own files, its logs among them
+        own = (f" && find '{self.base}/{rel.split('/')[0]}' -user 0 -exec chown --reference='{self.base}' {{}} +"
+               if self.frame else "")
         code, out = self.sh(f"mkdir -p '{dest.rsplit('/', 1)[0]}' && mv -f '{part}' '{dest}'{own} && echo moved")
         if "moved" not in out:
             raise IOError(f"couldn't move {rel} into place on the headset: {out.strip()}")
@@ -593,7 +596,7 @@ def read_buttons(adb, serial):
 
 
 def write_buttons(adb, serial, text):
-    """Writes the button layout file (buttons.to_text); Echo uses it the next time it starts."""
+    """Writes the Steam Frame settings file (buttons.to_text); Echo uses it the next time it starts."""
     import tempfile
     store = Storage(adb, serial)
     store.check_writable()

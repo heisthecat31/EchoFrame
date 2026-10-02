@@ -285,7 +285,7 @@ IGNORE(ovr_RichPresenceOptions_SetStartTime)
 // The microphone is real: Echo's OVR provider reads 16-bit mono PCM at 48 kHz from
 // ovr_Microphone_GetPCM and encodes and sends it itself (incoming voice never touches the
 // Platform SDK: players were heard with the VoIP decoder below producing nothing). Captured
-// with AAudio into a one-second ring buffer; when Echo falls behind, the oldest samples go.
+// with AAudio into a 250 ms ring buffer; when Echo falls behind, the oldest samples go.
 #define MIC_RATE 48000
 #define MIC_RING (MIC_RATE / 4)   // 250 ms: a slow reader gets recent sound, not sound a second old
 typedef struct {
@@ -293,16 +293,27 @@ typedef struct {
     pthread_mutex_t lock;
     int16_t ring[MIC_RING];
     size_t head, count;
-    uint64_t captured, lastLog, dropped;   // dropped: overwritten before Echo read them
-    int peakIn;
+    uint64_t captured, lastLog, dropped;   // dropped: overwritten or skipped before Echo read them
+    uint64_t sent20, sent40;               // Opus frames handed to Echo (20 and 40 ms)
+    int peakIn, peakOut;   // the microphone's peak, and the peak of what Echo gets
     double sumSq;
     float x1, x2, y1, y2;   // the high-pass filter's state (MicData)
 } Mic;
 
-// Steam Frame's microphone reaches Lepton hot (peaks at 0 dBFS, RMS -14 dBFS; an automatic
-// gain only distorted it further) and full of low rumble ("like high winds"): the samples go
-// through a 100 Hz high-pass and -6 dB. The input level is logged every 5 s.
-#define MIC_SCALE 0.5f
+// Low rumble ("like high winds") goes through a 100 Hz high-pass. Level: with whole Opus frames
+// (ovr_Microphone_GetPCM) and SteamOS's input at 50 %, the Frame's microphone peaks at about
+// -9 dBFS and the Quest 3's at -8, and players heard it a bit quiet: +6 dB, with a soft limiter
+// above -6 dBFS so shouting rounds off instead of clipping (the earlier -6 dB was for a
+// microphone that reached 0 dBFS, which an automatic gain had made worse). The input level, and
+// what Echo is sent, are logged every 5 s.
+#define MIC_SCALE 2.0f
+#define MIC_KNEE 16384.0f   // -6 dBFS: above it, tanh towards full scale
+static float SoftLimit(float y) {
+    float a = fabsf(y);
+    if (a <= MIC_KNEE) return y;
+    float out = MIC_KNEE + (32767.0f - MIC_KNEE) * tanhf((a - MIC_KNEE) / (32767.0f - MIC_KNEE));
+    return y < 0 ? -out : out;
+}
 // RBJ high-pass, f0 100 Hz, Q 0.7071, fs 48 kHz, normalised by a0
 #define HP_B0 0.990787f
 #define HP_B1 -1.981573f
@@ -323,9 +334,9 @@ static aaudio_data_callback_result_t MicData(AAudioStream* s, void* user, void* 
         float x = (float)in[i];
         float y = HP_B0 * x + HP_B1 * m->x1 + HP_B2 * m->x2 - HP_A1 * m->y1 - HP_A2 * m->y2;
         m->x2 = m->x1; m->x1 = x; m->y2 = m->y1; m->y1 = y;
-        y *= MIC_SCALE;
-        if (y > 32767.0f) y = 32767.0f;
-        if (y < -32768.0f) y = -32768.0f;
+        y = SoftLimit(y * MIC_SCALE);
+        int o = (int)(y < 0 ? -y : y);
+        if (o > m->peakOut) m->peakOut = o;
         m->ring[(m->head + m->count) % MIC_RING] = (int16_t)y;
         if (m->count < MIC_RING) m->count++;
         else { m->head = (m->head + 1) % MIC_RING; m->dropped++; }
@@ -336,13 +347,16 @@ static aaudio_data_callback_result_t MicData(AAudioStream* s, void* user, void* 
     m->sumSq += sum;
     if (m->captured - m->lastLog >= 5 * MIC_RATE) {   // every 5 s of capture
         double n = (double)(m->captured - m->lastLog);
-        LOG("Platform SDK: microphone level: peak %.1f dBFS, RMS %.1f dBFS; samples Echo didn't read in time: %llu of %.0f",
+        LOG("Platform SDK: microphone level: peak %.1f dBFS, RMS %.1f dBFS; to Echo: peak %.1f dBFS; samples Echo didn't "
+            "read in time: %llu of %.0f; Opus frames sent: %llu of 20 ms, %llu of 40 ms",
             20.0 * log10((m->peakIn > 0 ? m->peakIn : 1) / 32768.0), 10.0 * log10((m->sumSq > 0 ? m->sumSq : 1) / n / (32768.0 * 32768.0)),
-            (unsigned long long)m->dropped, n);
+            20.0 * log10((m->peakOut > 0 ? m->peakOut : 1) / 32768.0),
+            (unsigned long long)m->dropped, n, (unsigned long long)m->sent20, (unsigned long long)m->sent40);
         m->lastLog = m->captured;
-        m->peakIn = 0;
+        m->peakIn = m->peakOut = 0;
         m->sumSq = 0;
         m->dropped = 0;
+        m->sent20 = m->sent40 = 0;
     }
     return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
@@ -402,14 +416,36 @@ EXPORT void ovr_Microphone_Destroy(void* h) {
     free(m);
 }
 
+// Echo reads the microphone once per game update (CR15NetVoipBroadcasterCS::UpdateRecord: up to
+// MicAvailable() samples) and hands what it got straight to opus_encode as the frame size
+// (libpnsrad's VoipEncode; Opus at 48 kHz, 24 kbit/s, 256-byte packets). Opus only takes
+// 2.5/5/10/20/40/60 ms frames, so any other count fails and that update sends nothing: returning
+// whatever had built up (667 samples an update at 72 Hz, 1333 at 36) lost most of the voice. So
+// Echo gets whole Opus frames only: 20 ms, or 40 ms when it has fallen behind (a slow frame; the
+// Frame build lets it ask for up to 2880), and nothing until 20 ms is there. 60 ms isn't used:
+// at 24 kbit/s its packets can outgrow Echo's 256 bytes. Sound older than MIC_LAG is dropped
+// after a read, so a stall doesn't leave the voice running late.
+#define MIC_LAG (MIC_RATE / 10)   // 100 ms
+static const size_t kOpusFrames[] = { 1920, 960, 480, 240, 120 };
 EXPORT size_t ovr_Microphone_GetPCM(void* h, int16_t* out, size_t n) {
     Mic* m = h;
     if (!m || !out) return 0;
     pthread_mutex_lock(&m->lock);
-    size_t got = n < m->count ? n : m->count;
+    size_t smallest = n >= 960 ? 960 : 120;   // 20 ms packets unless Echo asks for less
+    size_t got = 0;
+    for (size_t i = 0; i < sizeof kOpusFrames / sizeof kOpusFrames[0] && !got; ++i)
+        if (kOpusFrames[i] <= n && kOpusFrames[i] <= m->count && kOpusFrames[i] >= smallest) got = kOpusFrames[i];
     for (size_t i = 0; i < got; ++i) out[i] = m->ring[(m->head + i) % MIC_RING];
     m->head = (m->head + got) % MIC_RING;
     m->count -= got;
+    if (m->count > MIC_LAG) {   // running late: keep the newest 100 ms
+        size_t skip = m->count - MIC_LAG;
+        m->head = (m->head + skip) % MIC_RING;
+        m->count = MIC_LAG;
+        m->dropped += skip;
+    }
+    if (got == 1920) m->sent40++;
+    else if (got) m->sent20++;
     pthread_mutex_unlock(&m->lock);
     return got;
 }

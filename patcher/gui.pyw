@@ -231,7 +231,7 @@ class App(tk.Tk):
              ("Make the OpenXR version", self.page_build), ("Connect the headset", self.page_connect),
              ("Install", self.page_install)]
         if self.headset == "frame":
-            s.append(("Controls and sound", self.page_controls))
+            s.append(("Button layout", self.page_controls))
         s.append(("Play", self.page_play))
         return s
 
@@ -482,8 +482,6 @@ class App(tk.Tk):
         self.details_box(560)
 
     def page_controls(self):
-        self.text(CX, 108, "How the Frame's controllers work in Echo, and its microphone and frame rate. Install puts "
-                           "these on the Frame; to change them later, Save to headset.", "body", MUTED, width=CW)
         if not self.btn_panel:
             colors = dict(BG=BG, CARD=CARD, BORDER=BORDER, TEXT=TEXT, MUTED=MUTED, FAINT=FAINT, ACCENT=ACCENT,
                           GOOD=GOOD, WARN=WARN)
@@ -491,7 +489,7 @@ class App(tk.Tk):
                                                   self.buttons_save)
         ok, _ = self.device_ready()
         self.btn_panel.set_can_save(ok and not self.dev_busy)
-        self.cv.create_window(self.px(CX + (CW - buttons.PANEL_W) / 2), self.px(160), window=self.btn_panel, anchor="nw")
+        self.cv.create_window(self.px(CX + (CW - buttons.PANEL_W) / 2), self.px(110), window=self.btn_panel, anchor="nw")
 
     def page_play(self):
         ok, dev = self.device_ready()
@@ -511,7 +509,7 @@ class App(tk.Tk):
         self.bullets(CX + 20, 384, [
             "Play for a minute with the problem happening, then press Save logs and send the file.",
             "Updating later: make it again with the same file name (your key is reused), then Install.",
-        ] + (["The Frame's Steam button and SteamOS keep their own controls; Echo's layout is in Controls and sound."]
+        ] + (["The Frame's Steam button and SteamOS keep their own controls; Echo's buttons are in step 6, Button layout."]
              if frame else []), width=CW - 40)
 
     def quick_commands(self):

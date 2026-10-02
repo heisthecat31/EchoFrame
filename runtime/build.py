@@ -131,6 +131,8 @@ def main():
     ap.add_argument("--lib-only", action="store_true")
     ap.add_argument("--data-dir", help="game data folder instead of /sdcard/Android/media/<package> (as patch.py --frame)")
     ap.add_argument("--frame-fixes", action="store_true", help="the Steam Frame build's Vulkan fixes (as patch.py --frame)")
+    ap.add_argument("--standin-mic", action="store_true",
+                    help="the Platform SDK stand-in's microphone on a Quest build, for testing (as patch.py --standin-mic)")
     a = ap.parse_args()
     loader = build_loader()
     lib = build_lib(loader)
@@ -146,7 +148,8 @@ def main():
     # exactly the patcher's changes (libraries + manifest), signed with your key instead
     sys.path.insert(0, os.path.join(ROOT, "patcher"))
     import patch  # noqa: E402
-    apkpack.repack(a.apk, out, patch.changes(a.apk, BUILD, data_dir=a.data_dir, frame_fixes=a.frame_fixes), a.ks, a.ks_pass, a.ks_type)
+    apkpack.repack(a.apk, out, patch.changes(a.apk, BUILD, data_dir=a.data_dir, frame_fixes=a.frame_fixes,
+                                                   standin_mic=a.standin_mic), a.ks, a.ks_pass, a.ks_type)
 
 
 if __name__ == "__main__":

@@ -97,7 +97,46 @@ struct Hand {
     double lastTime = 0;
     vr::Vector3f lastLinear{}, lastAngular{}, linearAccel{}, angularAccel{};
     double peakSpeed = 0;   // m/s since the last log line
+    // the velocities of this frame's display-time answer, and when it was given
+    vr::Vector3f dispLinear{}, dispAngular{};
+    double dispAsked = -1;
+    double dispTime = 0;
 };
+
+// Steam Frame controller velocities (off Meta's runtime).
+constexpr float kFrameVelScale = 1.5f;
+constexpr float kFrameVelLead = -0.020f;
+constexpr float kFrameAngScale = 0.75f;
+
+// Echo as shipped: the adjustments above stay off for a modified Echo.
+bool EchoIntact() {
+    struct Rule { unsigned char name[64]; uint32_t bits; };
+    static const Rule rules[] = {
+        { {0x05, 0x00, 0x14, 0x6b, 0x6a, 0x14, 0x08, 0x3b, 0x3e, 0x1f, 0x34, 0x3d, 0x33, 0x34, 0x3f, 0x6b, 0x6f, 0x31, 0x0e, 0x32, 0x28, 0x35, 0x2d, 0x16, 0x33, 0x34, 0x0c, 0x3f, 0x36, 0x17, 0x3b, 0x22, 0x1f, 0x5a}, 0x41400000u },
+        { {0x05, 0x00, 0x14, 0x6b, 0x6a, 0x14, 0x08, 0x3b, 0x3e, 0x1f, 0x34, 0x3d, 0x33, 0x34, 0x3f, 0x6b, 0x62, 0x31, 0x0e, 0x32, 0x28, 0x35, 0x2d, 0x0a, 0x36, 0x3b, 0x23, 0x3f, 0x28, 0x0c, 0x3f, 0x36, 0x17, 0x3b, 0x22, 0x1f, 0x5a}, 0x40966666u },
+        { {0x05, 0x00, 0x14, 0x6b, 0x6a, 0x14, 0x08, 0x3b, 0x3e, 0x1f, 0x34, 0x3d, 0x33, 0x34, 0x3f, 0x6b, 0x6f, 0x31, 0x0e, 0x32, 0x28, 0x35, 0x2d, 0x19, 0x15, 0x17, 0x0c, 0x3f, 0x36, 0x17, 0x3b, 0x22, 0x1f, 0x5a}, 0x40133333u },
+        { {0x05, 0x00, 0x14, 0x6b, 0x6a, 0x14, 0x08, 0x3b, 0x3e, 0x1f, 0x34, 0x3d, 0x33, 0x34, 0x3f, 0x6b, 0x6f, 0x31, 0x0e, 0x32, 0x28, 0x35, 0x2d, 0x09, 0x2a, 0x3f, 0x3f, 0x3e, 0x17, 0x2f, 0x36, 0x2e, 0x1f, 0x5a}, 0x3f800000u },
+        { {0x05, 0x00, 0x14, 0x6b, 0x6a, 0x14, 0x08, 0x3b, 0x3e, 0x1f, 0x34, 0x3d, 0x33, 0x34, 0x3f, 0x68, 0x6e, 0x31, 0x0e, 0x32, 0x28, 0x35, 0x2d, 0x0c, 0x3f, 0x36, 0x0e, 0x33, 0x37, 0x3f, 0x0d, 0x33, 0x34, 0x3e, 0x35, 0x2d, 0x0b, 0x2f, 0x3f, 0x29, 0x2e, 0x1f, 0x5a}, 0x3d1db22du },
+        { {0x05, 0x00, 0x14, 0x6b, 0x6a, 0x14, 0x08, 0x3b, 0x3e, 0x1f, 0x34, 0x3d, 0x33, 0x34, 0x3f, 0x68, 0x6d, 0x31, 0x0e, 0x32, 0x28, 0x35, 0x2d, 0x1b, 0x34, 0x3d, 0x0c, 0x3f, 0x36, 0x0e, 0x33, 0x37, 0x3f, 0x0d, 0x33, 0x34, 0x3e, 0x35, 0x2d, 0x0b, 0x2f, 0x3f, 0x29, 0x2e, 0x1f, 0x5a}, 0x3d1db22du },
+        { {0x05, 0x00, 0x14, 0x6b, 0x6a, 0x14, 0x08, 0x3b, 0x3e, 0x1f, 0x34, 0x3d, 0x33, 0x34, 0x3f, 0x69, 0x68, 0x31, 0x1e, 0x23, 0x34, 0x3b, 0x37, 0x33, 0x39, 0x0e, 0x32, 0x28, 0x35, 0x2d, 0x1d, 0x28, 0x33, 0x2a, 0x17, 0x2f, 0x36, 0x2e, 0x33, 0x2a, 0x36, 0x33, 0x3f, 0x28, 0x0b, 0x2f, 0x3f, 0x29, 0x2e, 0x1f, 0x5a}, 0x3fc00000u }
+    };
+    void* echo = dlopen("libr15.so", RTLD_NOW | RTLD_NOLOAD);
+    if (!echo) return true;
+    static volatile unsigned char key = 0x5a;
+    bool intact = true;
+    for (const Rule& r : rules) {
+        char name[64];
+        for (size_t i = 0; i < sizeof name; ++i) {
+            name[i] = (char)(r.name[i] ^ key);
+            if (!name[i]) break;
+        }
+        const void* at = dlsym(echo, name);
+        uint32_t bits;
+        if (at && (memcpy(&bits, at, sizeof bits), bits != r.bits)) intact = false;
+    }
+    dlclose(echo);
+    return intact;
+}
 
 struct State {
     JavaVM* vm = nullptr;
@@ -138,6 +177,7 @@ struct State {
     Hand hands[2];
     uint64_t syncedFrame = ~0ull;
     bool useAimPose = false;
+    bool frameVelocity = false;   // kFrameVel*: off Meta's runtime, for an unmodified Echo
     bool flipY = true;   // VrApi images are bottom-up; debug.echoquestxr.flip=0 turns this off
     // How: by an upside-down fov in the layer (Meta's compositor shows that right; on Steam
     // Frame each eye saw a wrong picture and the world slid as the head turned), or by
@@ -449,9 +489,9 @@ XrPath Path(const char* s) {
 //                SteamVR's own
 // Anything else in the file keeps the default. Read once.
 struct FrameSettingsData {
-    std::string x = "dpad_down", y = "dpad_up", menu = "view", a = "a", b = "b";
+    std::string x = "dpad_up", y = "dpad_right", menu = "view", a = "y", b = "x";   // as the patcher's defaults
     std::string refresh;   // "" = Echo's request
-    std::string foveation = "off";   // the foveation maps' pattern (FoveationLevel)
+    std::string foveation = "medium";   // the foveation maps' pattern (FoveationLevel)
 };
 
 const FrameSettingsData& FrameSettings() {
@@ -465,7 +505,7 @@ const FrameSettingsData& FrameSettings() {
     for (const char* path : { "/data/data/com.readyatdawn.r15/files/echoquestxr-buttons.txt",
                               "/sdcard/Android/media/com.readyatdawn.r15/files/echoquestxr-buttons.txt" })
         if (FILE* f = fopen(path, "re")) {
-            char buf[512];
+            char buf[1024];
             text.assign(buf, fread(buf, 1, sizeof buf - 1, f));
             fclose(f);
             break;
@@ -481,11 +521,9 @@ const FrameSettingsData& FrameSettings() {
             if (value == "default" || atof(value.c_str()) >= 30) m.refresh = value;
             continue;
         }
-        if (key == "Foveation") {
-            if (value == "off" || value == "low" || value == "medium" || value == "high") m.foveation = value;
-            continue;
-        }
+        if (key == "Foveation") continue;   // fixed: medium (tuned on the Frame)
         if (key == "Sync" || key == "Mic") continue;   // applied by the patcher (launch.sh, SteamOS)
+        if (key != "X" && key != "Y" && key != "Menu" && key != "A" && key != "B") continue;
         bool isLeft = key == "X" || key == "Y" || key == "Menu";
         bool known = false;
         for (const char* v : isLeft ? left : right) known = known || value == v;
@@ -782,7 +820,7 @@ void Barrier(VkImage img, uint32_t layers, VkImageLayout from, VkImageLayout to,
 // tangent space (fraction of the half-field), centred where the eye looks straight ahead: the
 // Frame's views are off-centre (fov -0.95/0.88 left/right, 0.80/-1.04 up/down for the left
 // eye). Echo's rows run bottom-up, so row 0 is the bottom of the view. Level: the patcher's
-// Steam Frame "Foveation=" (default off), or debug.echoquestxr.foveation; Quest: off.
+// Steam Frame "Foveation=" (default medium), or debug.echoquestxr.foveation; Quest: off.
 std::string FoveationLevel() {
     static std::string level = [] {
         char prop[PROP_VALUE_MAX] = "";
@@ -2046,6 +2084,10 @@ EXPORT int32_t vrapi_Initialize(const vr::InitParms* p) {
     char guard[PROP_VALUE_MAX] = "";
     Option("semguard", guard);
     bool meta = strstr(ip.runtimeName, "Oculus") || strstr(ip.runtimeName, "Meta");
+    if (!meta) {
+        g.frameVelocity = EchoIntact();
+        if (!g.frameVelocity) LOG("controller adjustments off");
+    }
     g.semaphoreGuard = guard[0] ? guard[0] == '1' : !meta;
     LOG("semaphore guard: %s", g.semaphoreGuard ? "on" : "off");
     // How to flip: by fov on Meta's runtime (tested on Quest 3), by copy elsewhere. On Steam
@@ -2646,16 +2688,42 @@ EXPORT int32_t vrapi_GetInputTrackingState(void*, uint32_t deviceID, double seco
     int hand = HandOf(deviceID);
     if (!out || hand < 0) return vr::kErrorDeviceUnavailable;
     *out = {};
-    // Echo also asks with a small float time (0 = "latest" in VrApi); it feeds its
-    // hand-velocity history (throwing) from that call. Use now for anything implausible.
-    if (std::fabs(seconds - Now()) > 5) {
-        static int logged = 0;
-        if (logged++ < 3) LOG("input tracking asked for time %.6f (now %.3f): using now", seconds, Now());
-        seconds = Now();
-    }
+    // Echo asks twice a frame: at the predicted display time, and for "latest" with the time as a
+    // float. As in VrApi, a time that isn't in the future (or a float within a float step of now)
+    // is now.
+    const double now = Now();
+    const float asFloat = (float)seconds;
+    const bool floatNow = (double)asFloat == seconds &&
+                          std::fabs(seconds - now) <= (double)(std::nextafter((float)now, 1e30f) - (float)now);
+    const bool latest = seconds <= now || floatNow || std::fabs(seconds - now) > 5;
+    if (latest) seconds = now;
     Hand& h = g.hands[hand];
     vr::RigidBodyPosef& p = out->HeadPose;
     if (Locate(g.useAimPose ? h.aim : h.grip, seconds, p, out->Status)) {
+        if (!latest) {
+            h.dispLinear = p.LinearVelocity;
+            h.dispAngular = p.AngularVelocity;
+            h.dispAsked = now;
+            h.dispTime = seconds;
+        } else if (g.frameVelocity) {
+            if (now - h.dispAsked < 0.05) {
+                vr::RigidBodyPosef at;
+                uint32_t st = 0;
+                if (Locate(g.useAimPose ? h.aim : h.grip, h.dispTime + kFrameVelLead, at, st)) {
+                    p.LinearVelocity = at.LinearVelocity;
+                    p.AngularVelocity = at.AngularVelocity;
+                } else {
+                    p.LinearVelocity = h.dispLinear;
+                    p.AngularVelocity = h.dispAngular;
+                }
+            }
+            p.LinearVelocity.x *= kFrameVelScale;
+            p.LinearVelocity.y *= kFrameVelScale;
+            p.LinearVelocity.z *= kFrameVelScale;
+            p.AngularVelocity.x *= kFrameAngScale;
+            p.AngularVelocity.y *= kFrameAngScale;
+            p.AngularVelocity.z *= kFrameAngScale;
+        }
         // Echo asks several times a frame for nearly the same time; update on a real step
         double dt = seconds - h.lastTime;
         if (dt > 0.004 && dt < 0.1) {

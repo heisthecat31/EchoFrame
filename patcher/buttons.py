@@ -21,21 +21,11 @@ CHOICES = {
     "right": [("a", "A"), ("b", "B"), ("x", "X"), ("y", "Y"), ("menu", "Menu"), ("bumper", "Bumper (R1)"),
               ("none", "Nothing")],
 }
-# the display refresh rate to ask SteamVR for (Echo asks for 72 Hz; SteamVR has run it at half rate)
-REFRESH = [("72", "72 Hz (Echo's)"), ("90", "90 Hz"), ("120", "120 Hz"), ("default", "SteamVR's default")]
-# SteamVR's client waits on a GPU semaphore for each frame; Lepton passes vrclient's
-# DisableTimelineSemaphoreWait on to the app (device.frame_launch_env puts it in launch.sh)
-SYNC = [("wait", "SteamVR's normal wait"), ("skip", "Don't wait (test)")]
-# fixed foveated rendering (EchoQuestXR's fragment density maps), for the GPU time: in matches it
-# took 15-16 ms a frame on the Frame, more than 72 Hz allows
-FOVEATION = [("off", "Off"), ("low", "Low"), ("medium", "Medium"), ("high", "High")]
-# SteamOS's microphone input volume: the Frame's microphone clipped at full level
-MIC = [("keep", "Leave as is"), ("70", "70%"), ("50", "50%"), ("35", "35%")]
-DEFAULTS = {"X": "dpad_down", "Y": "dpad_up", "Menu": "view", "A": "a", "B": "b", "Sync": "wait",
-            "Foveation": "off", "Mic": "keep"}
-EXTRA = [("Sync", "SteamVR frame wait", SYNC),
-         ("Foveation", "Foveation", FOVEATION), ("Mic", "Microphone level", MIC)]
-PANEL_W, PANEL_H = 656, 452
+DEFAULTS = {"X": "dpad_up", "Y": "dpad_right", "Menu": "view", "A": "y", "B": "x", "Sync": "skip",
+            "Foveation": "medium", "Mic": "70"}
+# written as DEFAULTS whatever was chosen; only the button layout is the player's
+FIXED = ["Sync", "Foveation", "Mic"]
+PANEL_W, PANEL_H = 656, 340
 
 
 def parse(text):
@@ -46,14 +36,12 @@ def parse(text):
         key, _, value = line.strip().partition("=")
         if key in hands and value in {v for v, _ in CHOICES[hands[key]]}:
             m[key] = value
-        elif key in {k for k, _, _ in EXTRA} and value in dict(next(ch for k, _, ch in EXTRA if k == key)):
-            m[key] = value
     return m
 
 
 def to_text(m):
-    keys = [k for k, _ in ECHO_BUTTONS] + [k for k, _, _ in EXTRA]
-    return "".join(f"{k}={m.get(k, DEFAULTS[k])}\n" for k in keys)
+    text = "".join(f"{k}={m.get(k, DEFAULTS[k])}\n" for k, _ in ECHO_BUTTONS)
+    return text + "".join(f"{k}={DEFAULTS[k]}\n" for k in FIXED)
 
 
 def load_local(folder):
@@ -114,21 +102,6 @@ class ButtonsPanel(tk.Frame):
                                  font=self.font(11), bd=0)
             om.place(x=self.px(320), y=self.px(y))
             self.vars[key] = var
-        # the refresh rate and SteamVR's frame wait, under the buttons
-        for row, (key, label, choices) in enumerate(EXTRA):
-            y = 40 + 5 * 44 + 20 + row * 40
-            tk.Label(self, text=label, bg=c["CARD"], fg=c["TEXT"], font=self.font(12, True)).place(
-                x=self.px(178), y=self.px(y + 4))
-            var = tk.StringVar(value=dict(choices)[self.map.get(key, DEFAULTS[key])])
-            var.trace_add("write", lambda *_, k=key, ch=choices, v=var: self.pick_extra(k, ch, v))
-            om = tk.OptionMenu(self, var, *[n for _, n in choices])
-            om.configure(bg=c["BORDER"], fg=c["TEXT"], activebackground=c["ACCENT"], activeforeground="#ffffff",
-                         highlightthickness=0, bd=0, relief="flat", font=self.font(11), width=19, anchor="w",
-                         cursor="hand2")
-            om["menu"].configure(bg=c["CARD"], fg=c["TEXT"], activebackground=c["ACCENT"], activeforeground="#ffffff",
-                                 font=self.font(11), bd=0)
-            om.place(x=self.px(320), y=self.px(y))
-            self.vars[key] = var
 
         def btn(text, x, w, cmd, primary=False):
             b = tk.Button(self, text=text, command=cmd, bg=c["ACCENT"] if primary else c["BORDER"],
@@ -154,17 +127,9 @@ class ButtonsPanel(tk.Frame):
         self.on_change(dict(self.map))
         self.draw()
 
-    def pick_extra(self, key, choices, var):
-        self.map[key] = {n: v for v, n in choices}[var.get()]
-        self.status = ""
-        self.on_change(dict(self.map))
-        self.draw()
-
     def set_mapping(self, m):
         for key, hand in ECHO_BUTTONS:
             self.vars[key].set(dict(CHOICES[hand])[m[key]])
-        for key, _, choices in EXTRA:
-            self.vars[key].set(dict(choices)[m.get(key, DEFAULTS[key])])
 
     def defaults(self):
         self.set_mapping(DEFAULTS)
@@ -182,8 +147,8 @@ class ButtonsPanel(tk.Frame):
         cv, c, px = self.cv, self.c, self.px
         cv.delete("all")
         cv.create_text(px(20), px(12), anchor="nw", fill=c["MUTED"], font=self.font(11), width=px(PANEL_W - 40),
-                       text="Echo's buttons on the Frame's controllers, and settings for its frame rate and microphone. "
-                            "Install (or Save to headset) puts them on the headset; they apply the next time Echo starts.")
+                       text="Which Frame button does each of Echo's. Install (or Save to headset) puts the layout "
+                            "on the headset; Echo uses it the next time it starts.")
         on = {}   # Frame input -> Echo buttons on it
         for key, hand in ECHO_BUTTONS:
             if self.map[key] != "none":
