@@ -13,10 +13,11 @@ The changes (changes() below; runtime/build.py makes the same ones):
                                     the Vulkan fixes for its driver (frame_code())
 Everything else in the APK is copied unchanged.
 
-The result is signed with a NEW random key every time (RSA-2048, self-signed), so no two
-people share a signing key. The key is saved next to the APK as <name>.signing-key.pem;
-keep it private. Android only updates an app signed with the same key, so uninstall the
-existing Echo VR before installing a patched APK.
+The result is signed with your own random key (RSA-2048, self-signed), made the first time
+and saved next to the APK as <name>.signing-key.pem (keep it private), so no two people share
+a signing key. Patching to the same file again reuses that key, so the result updates Echo in
+place: Android (and Lepton on Steam Frame) only update an app signed with the same key, and
+uninstalling first deletes Echo's app data (on Steam Frame, its game data too).
 
 Signing is JAR (v1) signing in pure Python: Echo targets Android 10 (SDK 29), which
 accepts it, and nothing beyond Python and the `cryptography` package is needed.
@@ -121,6 +122,19 @@ def new_key():
             .not_valid_before(now - datetime.timedelta(days=1))
             .not_valid_after(now + datetime.timedelta(days=365 * 30))
             .sign(key, hashes.SHA256()))
+    return key, cert
+
+
+def load_key(path):
+    """(key, cert) from a .signing-key.pem this patcher wrote earlier, or None."""
+    try:
+        data = open(path, "rb").read()
+        key = serialization.load_pem_private_key(data, password=None)
+        cert = x509.load_pem_x509_certificate(data)
+    except (OSError, ValueError):
+        return None
+    if cert.public_key().public_numbers() != key.public_key().public_numbers():
+        return None
     return key, cert
 
 
@@ -249,8 +263,17 @@ def patch(apk, out, log=print, data_dir=None, frame=False):
         entries.append((info, data))
         log(f"  added {n}")
 
-    log("Generating a new random signing key...")
-    key, cert = new_key()
+    key_path = os.path.splitext(out)[0] + ".signing-key.pem"
+    reused = load_key(key_path)
+    if reused:
+        # your own earlier key for this APK: Android (and Lepton) then update Echo in place
+        # instead of uninstalling it, which would delete its app data (on the Frame, the
+        # game data too)
+        log(f"Reusing your signing key {os.path.basename(key_path)} (so this updates Echo and keeps its data)")
+        key, cert = reused
+    else:
+        log("Generating a new random signing key...")
+        key, cert = new_key()
     fingerprint = cert.fingerprint(hashes.SHA256()).hex()
     manifest, sf, rsa_block = jar_signature([(i.filename, d) for i, d in entries if not i.is_dir()], key, cert)
 
@@ -268,11 +291,11 @@ def patch(apk, out, log=print, data_dir=None, frame=False):
                 zout.writestr(info, data)
     os.replace(tmp, out)
 
-    key_path = os.path.splitext(out)[0] + ".signing-key.pem"
-    with open(key_path, "wb") as f:
-        f.write(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
-                                  serialization.NoEncryption()))
-        f.write(cert.public_bytes(serialization.Encoding.PEM))
+    if not reused:
+        with open(key_path, "wb") as f:
+            f.write(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                      serialization.NoEncryption()))
+            f.write(cert.public_bytes(serialization.Encoding.PEM))
     log(f"Wrote {out} ({os.path.getsize(out) // (1024 * 1024)} MB)")
     log(f"Signing key: {key_path}")
     log(f"Key fingerprint (SHA-256): {fingerprint}")

@@ -2,7 +2,7 @@
 
     pythonw gui.pyw      (double-click on Windows)
 
-Same patches as patch.py; every run signs with a new random key. Step 3 installs the
+Same patches as patch.py; signed with your own random key, reused for your updates. Step 3 installs the
 result on a connected headset, starts Echo and saves its logs (device.py). Drawn on one
 Canvas in EchoXR's installer style (palette and gradient from EchoXR's installer/ui.h).
 """
@@ -202,14 +202,14 @@ class App(tk.Tk):
             self.text(94, y + 18, "Patched and signed" + (" for Steam Frame" if self.built_for_frame else ""), "h", TEXT)
             self.text(94, y + 46, "Install it on your headset below, or with adb yourself:", "small", MUTED)
             self.text(94, y + 68, f'adb install "{os.path.basename(out)}"', "mono", TEXT)
-            self.text(94, y + 88, f"New signing key {fp[:16]}...  saved as {os.path.basename(key_path)} (keep it private)", "small", FAINT)
+            self.text(94, y + 88, f"Your signing key {fp[:16]}...  in {os.path.basename(key_path)} (keep it private; patch again to the same file to update)", "small", FAINT)
         elif self.state == "error":
             self.rrect(32, y, W - 64, 72, 16, mix(BAD, BG, .88), outline=mix(BAD, BG, .6))
             self.text(52, y + 14, "Couldn't patch", "h", BAD)
             self.text(52, y + 40, self.message, "small", TEXT, width=W - 104)
         else:
-            self.text(32, y + 4, "Every patch is signed with a brand-new random key, so no two installs share one.", "small", MUTED)
-            self.text(32, y + 24, "Android only updates an app signed with the same key: uninstall Echo VR before installing.", "small", MUTED)
+            self.text(32, y + 4, "Signed with your own random key, so no two people share one. Patching to the same file again reuses it.", "small", MUTED)
+            self.text(32, y + 24, "Android only updates an app signed with the same key; switching keys means uninstalling Echo VR first.", "small", MUTED)
 
         self.draw_headset(478)
 
@@ -456,14 +456,14 @@ class App(tk.Tk):
         threading.Thread(target=self.work, args=(self.apk, self.out, self.for_frame), daemon=True).start()
 
     def work(self, apk, out, for_frame=False):
-        steps = {"Runtime": .2, "  added": .4, "  replaced": .5, "Generating": .6, "Wrote": .95}
+        steps = {"Runtime": .2, "  added": .4, "  replaced": .5, "Generating": .6, "Reusing": .6, "Wrote": .95}
         def log(m):
             for k, v in steps.items():
                 if m.startswith(k):
                     self.msgs.put(("progress", v))
             self.msgs.put(("log", m))
-            if m.startswith("Generating"):
-                self.msgs.put(("message", "Signing with a new random key..."))
+            if m.startswith(("Generating", "Reusing")):
+                self.msgs.put(("message", "Signing..."))
         try:
             result = patch.patch(apk, out, log=log, frame=for_frame)
             self.msgs.put(("built_for_frame", for_frame))

@@ -36,8 +36,10 @@ It makes three changes: `lib/arm64-v8a/libvrapi.so` becomes the EchoQuestXR runt
 `lib/arm64-v8a/libopenxr_loader.so` (the Khronos OpenXR loader) is added, and the manifest
 gets a `LAUNCHER` entry plus the OpenXR permissions (Lepton on Steam Frame needs the first;
 both are harmless on Quest). The result is
-signed with a **new random key every time** (saved next to it as `.signing-key.pem`; keep
-it private), so no two people share a signing key.
+signed with **your own random key**, made the first time and saved next to it as
+`.signing-key.pem` (keep it private), so no two people share a signing key. Patching to the
+same file again reuses that key, so the new APK updates Echo in place: Android (and Lepton)
+uninstall an app whose key changed, which deletes its app data, and on Steam Frame its game data.
 
 Step 3 in the window does the rest, over USB or (Steam Frame) **Connect...** with the adb
 address Frame Control shows:

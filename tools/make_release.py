@@ -29,8 +29,10 @@ untested so far, on Steam Frame and other OpenXR headsets.
 1. Run EchoQuestXR-Patcher-v{version}.exe (Windows may warn about an unknown
    publisher: More info -> Run anyway).
 2. Choose your own Echo VR Quest APK. Nothing is uploaded; the original isn't changed.
-3. Patch and sign. Every patch is signed with a brand-new random key, saved next to
-   the APK as .signing-key.pem (keep it private).
+3. Patch and sign. The APK is signed with your own random key, saved next to it as
+   .signing-key.pem (keep it private). Patching to the same file again reuses that
+   key, so updates keep Echo's data (a new key means Echo gets reinstalled, which
+   deletes its data, and on Steam Frame its game data).
 4. Install:
    - Quest (or any headset over USB): step 3 "Headset" in the window. Turn on USB
      debugging first. Android only updates an app signed with the same key, so the
