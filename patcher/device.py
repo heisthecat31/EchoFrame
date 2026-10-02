@@ -17,6 +17,7 @@ import os
 import re
 import shlex
 import shutil
+import struct
 import subprocess
 import sys
 import urllib.request
@@ -306,6 +307,39 @@ FRAME_KEPT_LOGS = "; ".join([
     "2>/dev/null) | grep -E 'readyatdawn|coredump|xrclient|lepton' | grep -vE 'steamvr_logs_to_journald|podman\\[' | tail -200",
 ])
 
+# Steam Frame: Echo's newest crash dump: its name, then the file in base64 (the Frame's adb
+# is a SteamOS shell, and the folder belongs to Echo's user inside the container).
+FRAME_CRASH_DUMP = "; ".join([
+    f"S=$HOME/.local/share/Steam; ID=$(cat {LEPTON}/{PACKAGE}/instance.id 2>/dev/null)",
+    f"C=$S/steamapps/compatdata/$ID/internal/{PACKAGE}/files/_temp/crashes",
+    "F=$(podman unshare sh -c 'ls -t \"$0\"/*.dmp 2>/dev/null | head -1' \"$C\")",
+    "echo \"$F\"", "[ -n \"$F\" ] && podman unshare base64 -w0 \"$F\"",
+])
+
+
+def frame_crash_dump(adb, serial, path):
+    """Copies Echo's newest crash dump from the Frame to <path>-crash.dmp and returns what it
+    says (the signal, where it crashed, the stack) as lines for the log."""
+    import base64
+    import minidump   # next to this file
+    code, out = shell(adb, serial, FRAME_CRASH_DUMP, timeout=120)
+    name, _, data = out.strip().partition("\n")
+    if not name.endswith(".dmp") or not data.strip():
+        return ["(no crash dump found)"]
+    try:
+        dump = base64.b64decode("".join(data.split()))
+    except ValueError as e:
+        return [f"{name}: couldn't copy it ({e})"]
+    local = os.path.splitext(path)[0] + "-crash.dmp"
+    with open(local, "wb") as f:
+        f.write(dump)
+    lines = [f"{name} ({len(dump)} bytes, saved as {os.path.basename(local)})"]
+    try:
+        return lines + minidump.summary(dump)
+    except (minidump.MinidumpError, struct.error) as e:
+        return lines + [f"couldn't read it: {e}"]
+
+
 
 def save_logs(adb, serial, path):
     """Writes Echo's log (everything its process logged), the crash log and the OpenXR lines to
@@ -326,6 +360,7 @@ def save_logs(adb, serial, path):
             code, kept = shell(adb, serial, FRAME_KEPT_LOGS, timeout=120)
             out, android = ("(Echo's Lepton container isn't running: the logs Lepton and Steam kept)\n"
                             + kept.replace("\0", "")), True
+            out += "\n=== Echo's newest crash dump\n" + "\n".join(frame_crash_dump(adb, serial, path)) + "\n"
     if not android:
         first = out.strip().splitlines()[-1] if out.strip() else "no output"
         code, diag = run(adb, "-s", serial, "shell", PROBE, timeout=90)

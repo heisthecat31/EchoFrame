@@ -169,6 +169,9 @@ private folder exists.
 3. In the window: Connect... (Frame Control's address), Install, Launch, Save logs. The
    log's EchoQuestXR lines list the OpenXR extensions, the Vulkan extensions left out, and
    any swapchain-format problem.
+   If Echo has crashed, Save logs also copies its newest crash dump next to the log
+   (`<log>-crash.dmp`) and adds where it crashed: the signal, pc and lr as library + offset,
+   and the return addresses on the crashing thread's stack.
 
 ## Not done yet
 

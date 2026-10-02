@@ -135,7 +135,7 @@ def main():
          "--specpath", work, "--paths", patcher,
          "--add-data", f"{libs[0]}{sep}runtime", "--add-data", f"{libs[1]}{sep}runtime",
          "--add-data", f"{ico}{sep}.", "--add-data", f"{version_file}{sep}.",
-         "--hidden-import", "patch", "--hidden-import", "device", "--hidden-import", "axml",
+         "--hidden-import", "patch", "--hidden-import", "device", "--hidden-import", "axml", "--hidden-import", "minidump",
          os.path.join(patcher, "gui.pyw")])
     exe = os.path.join(REL, name + ".exe")
     zpath = os.path.join(REL, name + ".zip")
