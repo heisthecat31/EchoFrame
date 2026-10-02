@@ -291,6 +291,22 @@ LOG_SCRIPT = "; ".join([
 ])
 
 
+# Steam Frame, once Echo's container has stopped: Lepton's saved logcats, the instance's log,
+# Echo's crash dumps (listed) and the journal lines about Echo. Runs on SteamOS.
+FRAME_KEPT_LOGS = "; ".join([
+    f"S=$HOME/.local/share/Steam; ID=$(cat {LEPTON}/{PACKAGE}/instance.id 2>/dev/null)",
+    f"D=$S/steamapps/compatdata/$ID/internal/{PACKAGE}",
+    "echo '=== Lepton logcats'", "ls -lt $S/logs/lepton-logcats 2>&1 | head -10",
+    "for f in $(find $S/logs/lepton-logcats -type f -printf '%T@ %p\\n' 2>/dev/null | sort -rn | head -2 | cut -d' ' -f2-); "
+    "do echo \"=== $f\"; tail -c 800000 \"$f\"; echo; done",
+    "echo \"=== lepton-steamlaunch-$ID.log\"", "tail -c 200000 $S/logs/lepton-steamlaunch-$ID.log 2>&1",
+    "echo; echo '=== Echo crash dumps'", "podman unshare ls -la $D/files/_temp/crashes 2>&1 | head -20",
+    "echo '=== journal: Echo, its SteamVR client, crashes'",
+    "(journalctl -n 6000 --no-pager -o short-precise 2>/dev/null; journalctl --user -n 6000 --no-pager -o short-precise "
+    "2>/dev/null) | grep -E 'readyatdawn|coredump|xrclient|lepton' | grep -vE 'steamvr_logs_to_journald|podman\\[' | tail -200",
+])
+
+
 def save_logs(adb, serial, path):
     """Writes Echo's log (everything its process logged), the crash log and the OpenXR lines to
     `path`. If the headset's shell can't run logcat at all, writes what that shell is instead,
@@ -306,8 +322,10 @@ def save_logs(adb, serial, path):
         code, got = shell(adb, serial, f"podman exec {LEPTON_CONTAINER} sh -c {shlex.quote(script)} 2>&1", timeout=90)
         if code == 0 and got.strip() and "no such container" not in got and "Error:" not in got[:200]:
             out, android = "(logs from Echo's Lepton container)\n" + got, True
-        else:
-            out = f"(Echo's Lepton container isn't running: start Echo, then Save logs)\n{got}"
+        else:   # it has stopped (Echo exited or crashed): what Lepton and Steam kept on SteamOS
+            code, kept = shell(adb, serial, FRAME_KEPT_LOGS, timeout=120)
+            out, android = ("(Echo's Lepton container isn't running: the logs Lepton and Steam kept)\n"
+                            + kept.replace("\0", "")), True
     if not android:
         first = out.strip().splitlines()[-1] if out.strip() else "no output"
         code, diag = run(adb, "-s", serial, "shell", PROBE, timeout=90)
