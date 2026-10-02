@@ -70,6 +70,14 @@ FRAME_CODE_PATCHES = [
     # always enabled (EchoQuestXR only offers ones the driver has).
     ("enables every Vulkan device extension the runtime asks for (Echo only reads 128)",
      "e80240b9" "9c070091" "d6120491" "9f0308eb" "c3feff54" "d3ffff17" "e8ab4fb9", 20, "1f2003d5"),
+    # Echo reserves two queues in the graphics family, one for rendering and one for its
+    # uploader (CQueueResolver::Reserve hands out one queue index each). Mesa's turnip has
+    # one queue there, so the uploader's reservation fails, its VkQueue stays NULL and its
+    # first vkQueueSubmit crashed in libvulkan (crash dump: SIGSEGV at 0, libvulkan.so+0x1d594
+    # called from libr15.so+0x18ebb1c). The uploader queue now starts as the render queue
+    # (`mov x8, xzr` -> `mov x8, x21`); a successful reservation (Quest) still replaces it.
+    ("gives Echo's uploader the render queue when the driver has only one",
+     "e8274091" "08010b91" "158560f9" "e8031faa" "7f060031" "b5af05f9" "c0010054", 12, "e80315aa"),
 ]
 
 
