@@ -22,14 +22,15 @@ This repository ships **no game files, no APKs and no logs**. You supply your ow
 | 1. VrApi logger: record every call Echo makes on a Quest 3 | ✅ [docs/vrapi-calls.md](docs/vrapi-calls.md) |
 | 2. Button layout (press each button once) | ✅ same document |
 | 3. `libvrapi.so` on OpenXR, on Quest 3 | ✅ plays: view, head tracking, hands, every button, throwing |
-| 4. Package for Lepton and test on Steam Frame | next |
+| 4. Package for Lepton and test on Steam Frame | ✅ plays in matches: view, head and hand tracking, the Frame's controllers (button layout in the window), voice chat both ways; 72 fps in menus, 60-72 in matches |
 
-Tested on a Quest 3 (Horizon OS, Meta OpenXR runtime 85) with Echo VR build 4987566.
+Tested on a Quest 3 (Horizon OS, Meta OpenXR runtime 85) and a Steam Frame (SteamOS, SteamVR,
+Lepton) with Echo VR build 4987566.
 
 ## Patching your APK (`patcher/`)
 
-A step-by-step window (your headset, your APK, make it, connect, install, controls and
-sound on the Frame, play): choose your Echo VR APK, and it writes a patched copy next to it.
+A step-by-step window (your headset, your APK, make it, connect, install, button layout on
+the Frame, play): choose your Echo VR APK, and it writes a patched copy next to it.
 **Advanced** (bottom left) is a terminal on the headset (adb shell; SteamOS on a Frame).
 
 ```bash
