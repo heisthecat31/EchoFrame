@@ -10,7 +10,7 @@ The changes (changes() below; runtime/build.py makes the same ones):
                                     declared (axml.py)
   libr15.so, libassetpatch.so       Steam Frame build only (--frame): the game data path
                                     becomes Echo's private folder (relocate()), and
-                                    Echo asks for Vulkan 1.0 (vulkan_1_0())
+                                    the Vulkan fixes for its driver (frame_code())
 Everything else in the APK is copied unchanged.
 
 The result is signed with a NEW random key every time (RSA-2048, self-signed), so no two
@@ -52,13 +52,24 @@ SIGNATURE_FILES = (".SF", ".RSA", ".DSA", ".EC")
 MEDIA_DIR = "/sdcard/Android/media/com.readyatdawn.r15"
 FRAME_DATA_DIR = "/data/data/com.readyatdawn.r15"
 DATA_DIR_LIBS = ("libr15.so", "libassetpatch.so")
-# Echo's CGS::Initialize sets VkApplicationInfo engineVersion and apiVersion with one
-# `movi v0.2s, #0x1`: apiVersion 1 is version 0.0.1. Quest's driver takes it; Mesa (Steam
-# Frame) treats it as older than 1.0 and exposes no core functions, so vkCreateInstance
-# fails with VK_ERROR_INCOMPATIBLE_DRIVER. `movi v0.2s, #0x40, lsl #16` makes both 0x400000,
-# Vulkan 1.0. Matched on that instruction and the three after it, which must occur once.
-VK_API_OLD = bytes.fromhex("2004000f" "283300b9" "e8a32e91" "00001e91")
-VK_API_NEW = bytes.fromhex("0044020f")
+# Code changes in Echo's CGS::Initialize (libr15.so, build 4987566) for the Frame's Mesa
+# driver: (what, bytes to find (exactly once), offset in them, replacement).
+FRAME_CODE_PATCHES = [
+    # VkApplicationInfo engineVersion and apiVersion are set with one `movi v0.2s, #0x1`:
+    # apiVersion 1 is version 0.0.1. Quest's driver takes it; Mesa treats it as older than
+    # 1.0 and exposes no core functions, so vkCreateInstance fails with
+    # VK_ERROR_INCOMPATIBLE_DRIVER. `movi v0.2s, #0x40, lsl #16`: both 0x400000, Vulkan 1.0.
+    ("asks for Vulkan 1.0 (was 0.0.1, which Mesa refuses)",
+     "2004000f" "283300b9" "e8a32e91" "00001e91", 0, "0044020f"),
+    # Echo reads at most 128 device extensions (min(count, 128) into a 128-entry stack array),
+    # and an extension VrApi asks for that isn't among them is logged "Required extension %s
+    # does not exist" and left out. Mesa lists far more, so VK_ANDROID_external_memory_
+    # android_hardware_buffer and VK_EXT_queue_family_foreign (needed by SteamVR) were left
+    # out and Echo crashed. The `b` to that log becomes a nop, so VrApi's extensions are
+    # always enabled (EchoQuestXR only offers ones the driver has).
+    ("enables every Vulkan device extension the runtime asks for (Echo only reads 128)",
+     "e80240b9" "9c070091" "d6120491" "9f0308eb" "c3feff54" "d3ffff17" "e8ab4fb9", 20, "1f2003d5"),
+]
 
 
 class PatchError(Exception):
@@ -172,24 +183,29 @@ def relocate(data, new_dir):
     return bytes(data), count
 
 
-def vulkan_1_0(data):
-    """libr15.so asking for Vulkan 1.0 instead of 0.0.1 (VK_API_OLD above)."""
-    i = data.find(VK_API_OLD)
-    if i < 0 or data.find(VK_API_OLD, i + 1) >= 0:
-        raise PatchError("Couldn't find Echo's Vulkan version setting in libr15.so (made for build 4987566)")
-    return data[:i] + VK_API_NEW + data[i + len(VK_API_NEW):]
+def frame_code(data, log=print):
+    """libr15.so with FRAME_CODE_PATCHES applied."""
+    data = bytearray(data)
+    for what, find, at, new in FRAME_CODE_PATCHES:
+        find, new = bytes.fromhex(find), bytes.fromhex(new)
+        i = data.find(find)
+        if i < 0 or data.find(find, i + 1) >= 0:
+            raise PatchError(f"Couldn't find the code to change in libr15.so ({what}); "
+                             "the Steam Frame build is made for Echo VR build 4987566")
+        data[i + at:i + at + len(new)] = new
+        log(f"  libr15.so: {what}")
+    return bytes(data)
 
 
-def changes(apk, runtime, log=print, data_dir=None, vk_1_0=False):
+def changes(apk, runtime, log=print, data_dir=None, frame_fixes=False):
     """{entry name: new bytes}: every change EchoQuestXR makes to an Echo VR APK. data_dir:
-    where Echo reads its game data instead of /sdcard/Android/media/<package>; vk_1_0: Echo
-    asks for Vulkan 1.0 (VK_API_OLD). The Steam Frame build does both (FRAME_DATA_DIR)."""
+    where Echo reads its game data instead of /sdcard/Android/media/<package>; frame_fixes:
+    FRAME_CODE_PATCHES. The Steam Frame build does both (FRAME_DATA_DIR)."""
     out = {LIB + f: open(os.path.join(runtime, f), "rb").read() for f in RUNTIME_FILES}
     with zipfile.ZipFile(apk) as z:
         out["AndroidManifest.xml"] = axml.patch_manifest(z.read("AndroidManifest.xml"), log)
-        if vk_1_0:
-            out[LIB + "libr15.so"] = vulkan_1_0(z.read(LIB + "libr15.so"))
-            log("  libr15.so: asks for Vulkan 1.0 (was 0.0.1, which Mesa refuses)")
+        if frame_fixes:
+            out[LIB + "libr15.so"] = frame_code(z.read(LIB + "libr15.so"), log)
         if data_dir:
             names = set(z.namelist())
             total = 0
@@ -211,7 +227,7 @@ def patch(apk, out, log=print, data_dir=None, frame=False):
     runtime = find_runtime()
     log(f"Runtime: {runtime}")
     try:
-        replace = changes(apk, runtime, log, data_dir or (FRAME_DATA_DIR if frame else None), vk_1_0=frame)
+        replace = changes(apk, runtime, log, data_dir or (FRAME_DATA_DIR if frame else None), frame_fixes=frame)
     except axml.AxmlError as e:
         raise PatchError(f"Couldn't update AndroidManifest.xml: {e}")
 
@@ -268,7 +284,7 @@ def main():
     ap.add_argument("apk")
     ap.add_argument("-o", "--out")
     ap.add_argument("--frame", action="store_true",
-                    help=f"Steam Frame build: game data in {FRAME_DATA_DIR}, Vulkan 1.0")
+                    help=f"Steam Frame build: game data in {FRAME_DATA_DIR}, Vulkan fixes for its driver")
     ap.add_argument("--data-dir", help="game data folder to use instead (testing)")
     a = ap.parse_args()
     out = a.out or os.path.splitext(a.apk)[0] + ("_openxr_frame.apk" if a.frame else "_openxr.apk")

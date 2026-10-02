@@ -91,7 +91,7 @@ def main():
     ap.add_argument("--ks-type", default="PKCS12", help="PKCS12 or JKS")
     ap.add_argument("--lib-only", action="store_true")
     ap.add_argument("--data-dir", help="game data folder instead of /sdcard/Android/media/<package> (as patch.py --frame)")
-    ap.add_argument("--vk-1-0", action="store_true", help="Echo asks for Vulkan 1.0 (as patch.py --frame)")
+    ap.add_argument("--frame-fixes", action="store_true", help="the Steam Frame build's Vulkan fixes (as patch.py --frame)")
     a = ap.parse_args()
     loader = build_loader()
     lib = build_lib(loader)
@@ -106,7 +106,7 @@ def main():
     # exactly the patcher's changes (libraries + manifest), signed with your key instead
     sys.path.insert(0, os.path.join(ROOT, "patcher"))
     import patch  # noqa: E402
-    apkpack.repack(a.apk, out, patch.changes(a.apk, BUILD, data_dir=a.data_dir, vk_1_0=a.vk_1_0), a.ks, a.ks_pass, a.ks_type)
+    apkpack.repack(a.apk, out, patch.changes(a.apk, BUILD, data_dir=a.data_dir, frame_fixes=a.frame_fixes), a.ks, a.ks_pass, a.ks_type)
 
 
 if __name__ == "__main__":
