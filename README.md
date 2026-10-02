@@ -144,7 +144,7 @@ How it fits Lepton (from [Frame Control](https://github.com/saphid/frame-control
 
 So the Frame build (**For Steam Frame** in the window, `patch.py --frame`) changes every
 `/sdcard/Android/media/com.readyatdawn.r15` in `libr15.so` and `libassetpatch.so` to
-`/data/data/com.readyatdawn.r15`, in place (the new path is shorter). It also changes two
+`/data/data/com.readyatdawn.r15`, in place (the new path is shorter). It also changes three
 instructions in Echo's `CGS::Initialize` for the Frame's Mesa driver
 (`FRAME_CODE_PATCHES` in `patcher/patch.py`):
 - Echo asks for Vulkan apiVersion 1 (that is 0.0.1), which Quest's driver accepts but Mesa
@@ -154,6 +154,10 @@ instructions in Echo's `CGS::Initialize` for the Frame's Mesa driver
   SteamVR needs (Android hardware buffers, foreign queue family) were left out and Echo
   crashed. The Frame build enables every extension the runtime asks for; the runtime only
   asks for ones the driver has.
+- Echo reserves two queues in the graphics family, one for rendering and one for its
+  uploader. Mesa has one queue there, so the uploader's queue stayed NULL and its first
+  `vkQueueSubmit` crashed in `libvulkan.so`. The Frame build gives the uploader the render
+  queue when its own reservation fails; with two queues (Quest) it still gets its own.
 
 The runtime finds out which device extensions the driver has with a throwaway Vulkan
 instance, made before Echo's own: Lepton loads Valve's `fdm_injection` and `fossilize`
