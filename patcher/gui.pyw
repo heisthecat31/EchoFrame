@@ -29,7 +29,7 @@ ACCENT, ACCENT2, GOOD, WARN, BAD = "#5b8cff", "#9a6bff", "#3ddc97", "#ffb547", "
 W, H = 1000, 710
 SIDE_W = 250
 CX, CW = 290, 670            # the page's content column
-TAGS = ("quest", "frame", "pick", "out", "go", "use", "folder", "details", "data", "connect", "getadb", "install",
+TAGS = ("quest", "frame", "pick", "out", "go", "use", "skip", "folder", "details", "data", "connect", "getadb", "install",
         "launch", "logs", "back", "next", "advanced", "run", "q0", "q1", "q2", "q3", "q4", "step0", "step1", "step2", "step3", "step4", "step5", "step6")
 
 
@@ -116,6 +116,7 @@ class App(tk.Tk):
         self.state = "pick"           # pick -> ready -> working -> done | error
         self.message = ""
         self.result = None            # (out, key_path, fingerprint)
+        self.skip_apk = False         # "Echo's already set up": past the APK steps, no APK to install
         self.built_for_frame = False
         self.progress = 0.0
         self.lines = []
@@ -244,9 +245,9 @@ class App(tk.Tk):
         if name == "Your headset":
             return self.headset is not None
         if name == "Your Echo VR APK":
-            return bool(self.apk) and self.verdict_ok is not None
+            return self.skip_apk or self.result is not None or (bool(self.apk) and self.verdict_ok is not None)
         if name == "Make the OpenXR version":
-            return self.result is not None
+            return self.skip_apk or self.result is not None
         if name == "Connect the headset":
             return self.device_ready()[0]
         if name == "Install":
@@ -361,6 +362,10 @@ class App(tk.Tk):
             tint = GOOD if self.verdict_ok else (WARN if self.verdict_ok is False else BAD)
             self.status(CX + 28, 276, self.verdict, tint, width=CW - 56)
             self.text(CX + CW - 28, 210, "Change", "small", ACCENT, anchor="ne", tags=("pick",))
+        # done this before: past the APK steps
+        self.text(CX, 370, "DONE THIS BEFORE?", "label", FAINT)
+        self.link(CX, 394, "Already made the OpenXR version? Use that file", "use")
+        self.link(CX, 422, "Echo's already set up on the headset? Skip ahead to Connect", "skip")
 
     def page_build(self):
         frame = self.headset == "frame"
@@ -462,7 +467,8 @@ class App(tk.Tk):
         self.rrect(CX, y, CW, 112, 14, CARD, outline=BORDER)
         apk = self.installable()
         self.text(CX + 20, y + 16, "ECHO VR", "label", FAINT)
-        self.text(CX + 20, y + 36, os.path.basename(apk) if apk else "No APK made yet: game data only", "small",
+        self.text(CX + 20, y + 36, os.path.basename(apk) if apk else ("Already on the headset: game data only" if self.skip_apk
+                                                       else "No APK made yet: game data only"), "small",
                   TEXT if apk else WARN, width=CW - 40)
         box = "☑" if self.with_data else "☐"
         self.text(CX + 20, y + 70, f"{box}  Also copy Echo's game data (about 900 MB, downloaded once; skipped if it's "
@@ -600,6 +606,8 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------------ headset jobs
     def installable(self):
+        if self.skip_apk:            # Echo's already on the headset: game data only
+            return None
         if self.result:
             return self.result[0]
         return self.out if self.out and os.path.isfile(self.out) else None
@@ -784,6 +792,12 @@ class App(tk.Tk):
                 self.result = (path, key, "")
                 self.built_for_frame = path.endswith("_frame.apk") or self.headset == "frame"
                 self.state = "done"
+                self.skip_apk = False
+                self.go_to("Connect the headset")
+        elif t == "skip" and not working:   # Echo's on the headset already: Install only checks game data
+            self.skip_apk = True
+            self.result = None
+            self.go_to("Connect the headset")
         elif t == "folder" and self.result and sys.platform == "win32":
             subprocess.Popen(["explorer", "/select,", os.path.normpath(self.result[0])])
         elif t == "details":
@@ -793,6 +807,11 @@ class App(tk.Tk):
         elif t in ("getadb", "connect", "install", "launch", "logs") and not self.dev_busy:
             self.headset_click(t)
         self.draw()
+
+    def go_to(self, name):
+        names = [n for n, _ in self.steps()]
+        if name in names:
+            self.step = names.index(name)
 
     def set_frame(self, on):
         """The Steam Frame build or the Quest one, renaming the output to match."""
@@ -839,6 +858,7 @@ class App(tk.Tk):
         if not path:
             return
         self.apk = path
+        self.skip_apk = False
         self.out = os.path.splitext(path)[0] + ("_openxr_frame.apk" if self.headset == "frame" else "_openxr.apk")
         self.state, self.lines, self.result = "ready", [], None
         try:
