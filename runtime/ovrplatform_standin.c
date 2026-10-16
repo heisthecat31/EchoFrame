@@ -48,10 +48,62 @@
 typedef uint64_t ovrRequest;
 typedef uint64_t ovrID;
 
-// The app-scoped user ID and name this stand-in reports. Echo's community build doesn't use
-// them to log in (it hard-codes the ID; config.json does the login).
+// The user ID and name this stand-in reports (Echo logs in with the ID: the login's accountid).
+// They come from <media or data dir>/files/afk/user.txt when it exists ("id=<decimal ID>",
+// "name=<display name>", one per line; the installer writes it); these are the fallbacks.
 static const ovrID kUserID = 0x4563686f51585231ull;   // "EchoQXR1"
-static const char kUserName[] = "EchoQuestXR";
+
+static ovrID g_user_id = kUserID;
+static char g_user_name[64] = "EchoQuestXR";
+static pthread_once_t g_identity_once = PTHREAD_ONCE_INIT;
+
+static void LoadIdentity(void) {
+    char pkg[128] = "";
+    FILE* c = fopen("/proc/self/cmdline", "rb");
+    if (c) {
+        size_t n = fread(pkg, 1, sizeof pkg - 1, c);
+        pkg[n] = 0;
+        fclose(c);
+    }
+    const char* dirs[] = {"/sdcard/Android/media/%s/files/afk/user.txt", "/data/data/%s/files/afk/user.txt"};
+    for (int i = 0; i < 2; i++) {
+        char path[256];
+        snprintf(path, sizeof path, dirs[i], pkg);
+        FILE* f = fopen(path, "r");
+        if (!f) continue;
+        char line[160];
+        while (fgets(line, sizeof line, f)) {
+            line[strcspn(line, "\r\n")] = 0;
+            if (!strncmp(line, "id=", 3)) {
+                const char* v = line + 3;
+                if (!strncmp(v, "OVR-ORG-", 8)) v += 8;
+                char* end;
+                unsigned long long id = strtoull(v, &end, 10);
+                if (id && end != v && !*end) g_user_id = id;
+            } else if (!strncmp(line, "name=", 5)) {
+                // printable ASCII only, as Echo shows it
+                size_t k = 0;
+                for (const char* p = line + 5; *p && k < sizeof g_user_name - 1; p++)
+                    if (*p >= 0x20 && *p < 0x7f) g_user_name[k++] = *p;
+                if (k) g_user_name[k] = 0;
+            }
+        }
+        fclose(f);
+        LOG("Platform SDK: user %llu \"%s\" from %s", (unsigned long long)g_user_id, g_user_name, path);
+        return;
+    }
+    LOG("Platform SDK: no files/afk/user.txt for %s; built-in user %llu \"%s\"", pkg, (unsigned long long)g_user_id, g_user_name);
+}
+
+static ovrID UserID(void) {
+    pthread_once(&g_identity_once, LoadIdentity);
+    return g_user_id;
+}
+
+static const char* UserName(void) {
+    pthread_once(&g_identity_once, LoadIdentity);
+    return g_user_name;
+}
 static const char kNotAvailable[] = "Meta's Platform SDK isn't available on this headset (EchoQuestXR stand-in)";
 
 // ovrMessage_Entitlement_GetIsViewerEntitled: the one reply type Echo's provider checks
@@ -106,11 +158,12 @@ EXPORT int ovr_PlatformInitializeAndroid(const char* appId, void* activity, void
         g_initialized = 1;
     }
     LOG("Platform SDK: ovr_PlatformInitializeAndroid(app %s): started (stand-in, no Meta services)", appId ? appId : "?");
+    UserID();
     return 0;   // ovrPlatformInitialize_Success
 }
 
 EXPORT bool ovr_IsPlatformInitialized(void) { return g_initialized; }
-EXPORT ovrID ovr_GetLoggedInUserID(void) { return kUserID; }
+EXPORT ovrID ovr_GetLoggedInUserID(void) { return UserID(); }
 
 EXPORT Message* ovr_PopMessage(void) {
     pthread_mutex_lock(&g_lock);
@@ -162,7 +215,9 @@ PAYLOAD(ovr_Message_GetUserProof)
 REQUEST(ovr_Entitlement_GetIsViewerEntitled, MESSAGE_ENTITLEMENT, NULL)
 REQUEST(ovr_User_GetLoggedInUser, 0, NULL)
 REQUEST(ovr_User_GetOrgScopedID, 0, NULL)
-REQUEST(ovr_User_GetAccessToken, 0, "")
+// Echo's OVR provider asks for the user proof (and so logs in) only once it holds an access
+// token longer than one character; community servers don't check it.
+REQUEST(ovr_User_GetAccessToken, 0, "EchoQuestXR")
 REQUEST(ovr_User_GetUserProof, 0, NULL)
 REQUEST(ovr_User_GetLoggedInUserFriends, 0, NULL)
 REQUEST(ovr_User_GetLoggedInUserRecentlyMetUsersAndRooms, 0, NULL)
@@ -230,9 +285,9 @@ STRING(ovr_User_GetPresence)
 STRING(ovr_User_GetPresenceDeeplinkMessage)
 
 #define VALUE(type, name, v) EXPORT type name() { return v; }
-VALUE(ovrID, ovr_User_GetID, kUserID)
-VALUE(ovrID, ovr_OrgScopedID_GetID, kUserID)
-VALUE(const char*, ovr_User_GetOculusID, kUserName)
+VALUE(ovrID, ovr_User_GetID, UserID())
+VALUE(ovrID, ovr_OrgScopedID_GetID, UserID())
+VALUE(const char*, ovr_User_GetOculusID, UserName())
 VALUE(const char*, ovr_UserProof_GetNonce, g_nonce)
 VALUE(ovrID, ovr_Room_GetID, 0)
 VALUE(ovrID, ovr_LaunchDetails_GetRoomID, 0)
