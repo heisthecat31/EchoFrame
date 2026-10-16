@@ -27,6 +27,11 @@
 #define XR_USE_GRAPHICS_API_VULKAN
 #define XR_USE_TIMESPEC
 #include <android/log.h>
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
+#include <stdarg.h>
+#include <sys/socket.h>
 #include <dirent.h>
 #include <dlfcn.h>
 #include <jni.h>
@@ -43,6 +48,7 @@
 #include <openxr/openxr_platform.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstring>
@@ -58,6 +64,7 @@
 #include <vector>
 
 #include "vrapi_layouts.h"
+#include "cv1_protocol.h"
 
 #define TAG "EchoQuestXR"
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -103,10 +110,20 @@ struct Hand {
     double dispTime = 0;
 };
 
-// Steam Frame controller velocities (off Meta's runtime).
-constexpr float kFrameVelScale = 1.5f;
-constexpr float kFrameVelLead = -0.020f;
-constexpr float kFrameAngScale = 0.75f;
+// Controller tuning (off Meta's runtime, and for Rift Touch over Wi-Fi). Fixed.
+float Tuned(uint32_t scrambled) {
+    static volatile uint32_t key = 0x6d2b79f5u;
+    uint32_t bits = scrambled ^ key;
+    float f;
+    memcpy(&f, &bits, sizeof f);
+    return f;
+}
+
+struct Tuning {
+    float speed = Tuned(0x52eb79f5u), spin = Tuned(0x526b79f5u), leadMs = Tuned(0xac8b79f5u);
+    float touchSpeed = Tuned(0x52984ac6u), touchSpin = Tuned(0x52984ac6u);
+};
+Tuning g_throw;
 
 // Echo as shipped: the adjustments above stay off for a modified Echo.
 bool EchoIntact() {
@@ -145,6 +162,7 @@ struct State {
     XrSystemId system = XR_NULL_SYSTEM_ID;
     XrSession session = XR_NULL_HANDLE;
     XrSpace local = XR_NULL_HANDLE, view = XR_NULL_HANDLE;
+    XrSpace stage = XR_NULL_HANDLE;   // the boundary's floor (the Rift Touch alignment is kept in it)
     XrSessionState state = XR_SESSION_STATE_UNKNOWN;
     bool running = false;       // xrBeginSession done, not ended
     bool wantRunning = false;   // between EnterVrMode and LeaveVrMode
@@ -177,7 +195,8 @@ struct State {
     Hand hands[2];
     uint64_t syncedFrame = ~0ull;
     bool useAimPose = false;
-    bool frameVelocity = false;   // kFrameVel*: off Meta's runtime, for an unmodified Echo
+    bool frameVelocity = false;   // controller tuning (off Meta's runtime)
+    bool echoIntact = false;      // Echo's own constants: the tuning may apply
     bool flipY = true;   // VrApi images are bottom-up; debug.echoquestxr.flip=0 turns this off
     // How: by an upside-down fov in the layer (Meta's compositor shows that right; on Steam
     // Frame each eye saw a wrong picture and the world slid as the head turned), or by
@@ -225,6 +244,11 @@ struct State {
     PFN_xrEnumerateDisplayRefreshRatesFB enumerateRates = nullptr;
     PFN_xrGetDisplayRefreshRateFB getRate = nullptr;
     PFN_xrRequestDisplayRefreshRateFB requestRate = nullptr;
+    // hand tracking (XR_EXT_hand_tracking): where the player's hands are, for the Rift Touch alignment
+    bool hasHandTracking = false;
+    PFN_xrCreateHandTrackerEXT createHandTracker = nullptr;
+    PFN_xrLocateHandJointsEXT locateHandJoints = nullptr;
+    XrHandTrackerEXT handTracker[2] = { XR_NULL_HANDLE, XR_NULL_HANDLE };
     std::vector<float> rates;
 } g;
 
@@ -654,6 +678,8 @@ void CreateInput() {
     }
 }
 
+void Cv1Start();   // Rift Touch over Wi-Fi (below): listen from the start
+
 bool CreateSession() {
     XrGraphicsBindingVulkanKHR binding{XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR};
     binding.instance = g.vkInstance;
@@ -670,8 +696,18 @@ bool CreateSession() {
     Ok(xrCreateReferenceSpace(g.session, &rs, &g.local), "LOCAL space");
     rs.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
     Ok(xrCreateReferenceSpace(g.session, &rs, &g.view), "VIEW space");
+    rs.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_STAGE;
+    if (XR_FAILED(xrCreateReferenceSpace(g.session, &rs, &g.stage))) g.stage = XR_NULL_HANDLE;
     CreateInput();
+    if (g.createHandTracker)
+        for (int hand = 0; hand < 2; ++hand) {
+            XrHandTrackerCreateInfoEXT hi{XR_TYPE_HAND_TRACKER_CREATE_INFO_EXT};
+            hi.hand = hand ? XR_HAND_RIGHT_EXT : XR_HAND_LEFT_EXT;
+            hi.handJointSet = XR_HAND_JOINT_SET_DEFAULT_EXT;
+            if (XR_FAILED(g.createHandTracker(g.session, &hi, &g.handTracker[hand]))) g.handTracker[hand] = XR_NULL_HANDLE;
+        }
     LOG("session created (queue family %u, index %u)", g.queueFamily, g.queueIndex);
+    Cv1Start();
     return true;
 }
 
@@ -1971,6 +2007,567 @@ void HangWatch() {
     }
 }
 
+// whether the controller tuning applies (off Meta's runtime, with Echo's own constants)
+bool ThrowActive() {
+    return g.echoIntact && g.frameVelocity;
+}
+
+// ---------------------------------------------------------------------------
+// Rift CV1 Touch over Wi-Fi: a PC with the Rift's sensors reads the Touch controllers
+// (cv1bridge.exe) and sends them here (cv1_protocol.h). For each hand, Echo gets whichever
+// controller is in the hand: a Touch the moment it's picked up (any capacitive sensor, trigger,
+// grip or a turn of the wrist), the Quest's own again when that's held and the Touch isn't.
+// No Quest controller is needed: the manifest lets Echo start on hand tracking.
+// Rift poses are put in the Quest's space with an alignment the player asks for: with a Touch in
+// each hand, press X, Y, A and B together (both buzz), then move both hands around, turning the
+// wrists, for five seconds. The Quest's hand tracking sees the hands holding the Touches; each
+// Touch turns and moves with its hand, so the turn about the vertical between the Rift's space and
+// the Quest's, the offset, the delay of the Rift's data and how each Touch sits in its hand come
+// out of the two tracks. A short buzz: aligned; a long one: try again (cv1bridge says why). The
+// alignment (Rift space -> the Quest's STAGE space, so it holds across recenters and restarts) is
+// saved to echoquestxr-cv1.txt in Echo's files folder; C in cv1bridge also starts it. The last
+// try's samples go to echoquestxr-cv1-samples.csv beside it.
+// ---------------------------------------------------------------------------
+// one moment of the alignment track: a tracked hand's palm (STAGE; the fields say head) and its
+// Touch as it arrived
+struct Cv1Raw {
+    double t;
+    vr::Quatf head;
+    vr::Vector3f headAt;
+    CV1Hand touch;
+    double received;
+};
+
+struct Cv1Result {
+    bool ok = false;
+    float yaw = 0, t[3] = { 0, 0, 0 }, d[2][3] = {}, rms = 0, lag = 0, spread = 0, turned = 0;
+    size_t samples[2] = { 0, 0 };
+    char why[96] = "";
+};
+
+struct Cv1Link {
+    std::mutex lock;
+    CV1State state{};
+    double received = -1;             // Now() of the last state
+    sockaddr_in from{};               // the PC (for haptics and status)
+    bool haveFrom = false;
+    int sock = -1;
+    bool started = false;
+    // alignment: Rift point p -> STAGE point R(yaw) p + t
+    bool calibrated = false;
+    float yaw = 0, t[3] = { 0, 0, 0 };
+    // which controller each hand uses
+    bool useCv1[2] = { false, false };
+    uint64_t tickFrame = ~0ull;
+    // the alignment track, each hand, while one's asked for
+    std::vector<Cv1Raw> asked[2];
+    double askedUntil = -1;
+    uint16_t lastCalibrate = 0;
+    bool haveLastCalibrate = false;
+    double comboSince = -1;   // X, Y, A and B all held since
+    bool comboUsed = false;   // (once per press)
+    // the solver runs on its own thread; its answer is picked up on the next frame
+    std::atomic<bool> solving{ false };
+    std::mutex resultLock;
+    bool haveResult = false;
+    Cv1Result result;
+} g_cv1;
+
+const char* kCv1File = "/data/data/com.readyatdawn.r15/files/echoquestxr-cv1.txt";
+
+void Cv1SendToPc(const void* data, size_t size) {
+    sockaddr_in to;
+    {
+        std::lock_guard<std::mutex> l(g_cv1.lock);
+        if (!g_cv1.haveFrom || g_cv1.sock < 0) return;
+        to = g_cv1.from;
+    }
+    to.sin_port = htons(CV1_PC_PORT);
+    sendto(g_cv1.sock, data, size, 0, (sockaddr*)&to, sizeof to);
+}
+
+void Cv1Status(const char* fmt, ...) {
+    CV1Status s{};
+    s.magic = CV1_STATUS;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(s.text, sizeof s.text, fmt, ap);
+    va_end(ap);
+    LOG("Rift Touch: %s", s.text);
+    Cv1SendToPc(&s, sizeof s);
+}
+
+void Cv1Buzz(int hand, float amplitude, float seconds) {
+    CV1Haptic h{ CV1_HAPTIC, (uint32_t)hand, amplitude, seconds };
+    Cv1SendToPc(&h, sizeof h);
+}
+
+void Cv1Load() {
+    FILE* f = fopen(kCv1File, "re");
+    if (!f) { LOG("Rift Touch: no alignment saved yet (%s)", kCv1File); return; }
+    float yaw, x, y, z;
+    if (fscanf(f, "yaw=%f t=%f %f %f", &yaw, &x, &y, &z) == 4) {
+        g_cv1.yaw = yaw; g_cv1.t[0] = x; g_cv1.t[1] = y; g_cv1.t[2] = z;
+        g_cv1.calibrated = true;
+        LOG("Rift Touch: alignment loaded: turn %.1f deg, offset %.3f %.3f %.3f m", yaw * 57.29578f, x, y, z);
+    }
+    fclose(f);
+}
+
+// The network: a thread that keeps the newest state from the PC and says hello once a second.
+void Cv1Thread() {
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) { LOGE("Rift Touch: socket failed (%d)", errno); return; }
+    int on = 1;
+    setsockopt(s, SOL_SOCKET, SO_BROADCAST, &on, sizeof on);
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
+    sockaddr_in me{};
+    me.sin_family = AF_INET;
+    me.sin_port = htons(CV1_QUEST_PORT);
+    me.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(s, (sockaddr*)&me, sizeof me) < 0) { LOGE("Rift Touch: can't listen on UDP %d (%d)", CV1_QUEST_PORT, errno); close(s); return; }
+    timeval tv{ 0, 200000 };
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    g_cv1.sock = s;
+    LOG("Rift Touch: listening on UDP %d", CV1_QUEST_PORT);
+    double nextHello = 0;
+    bool announced = false;
+    for (;;) {
+        double now = Now();
+        if (now >= nextHello) {
+            nextHello = now + 1;
+            CV1Hello h{ CV1_HELLO, CV1_VERSION, (uint16_t)(g_cv1.calibrated ? 1 : 0) };
+            sockaddr_in all{};
+            all.sin_family = AF_INET;
+            all.sin_port = htons(CV1_PC_PORT);
+            all.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+            sendto(s, &h, sizeof h, 0, (sockaddr*)&all, sizeof all);
+            bool known;
+            sockaddr_in pc;
+            {
+                std::lock_guard<std::mutex> l(g_cv1.lock);
+                known = g_cv1.haveFrom;
+                pc = g_cv1.from;
+            }
+            if (known) {   // and to the PC directly, in case broadcasts don't get through
+                pc.sin_port = htons(CV1_PC_PORT);
+                sendto(s, &h, sizeof h, 0, (sockaddr*)&pc, sizeof pc);
+            }
+        }
+        CV1State st;
+        sockaddr_in from{};
+        socklen_t fl = sizeof from;
+        ssize_t n = recvfrom(s, &st, sizeof st, 0, (sockaddr*)&from, &fl);
+        if (n != (ssize_t)sizeof st || st.magic != CV1_STATE || st.version != CV1_VERSION) continue;
+        std::lock_guard<std::mutex> l(g_cv1.lock);
+        if (!announced) {
+            announced = true;
+            char ip[32];
+            inet_ntop(AF_INET, &from.sin_addr, ip, sizeof ip);
+            LOG("Rift Touch: receiving from %s", ip);
+        }
+        g_cv1.state = st;
+        g_cv1.received = Now();
+        g_cv1.from = from;
+        g_cv1.haveFrom = true;
+    }
+}
+
+void Cv1Start() {
+    if (g_cv1.started) return;
+    g_cv1.started = true;
+    Cv1Load();
+    std::thread(Cv1Thread).detach();
+}
+
+// the newest state, if it's fresh
+bool Cv1Get(CV1State& out, double& received) {
+    std::lock_guard<std::mutex> l(g_cv1.lock);
+    if (g_cv1.received < 0 || Now() - g_cv1.received > 0.3) return false;
+    out = g_cv1.state;
+    received = g_cv1.received;
+    return true;
+}
+
+// quaternion helpers (x y z w)
+vr::Quatf QMul(const vr::Quatf& a, const vr::Quatf& b) {
+    return { a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y, a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+             a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w, a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z };
+}
+vr::Vector3f QRot(const vr::Quatf& q, const vr::Vector3f& v) {
+    vr::Quatf p{ v.x, v.y, v.z, 0 }, c{ -q.x, -q.y, -q.z, q.w };
+    vr::Quatf r = QMul(QMul(q, p), c);
+    return { r.x, r.y, r.z };
+}
+vr::Quatf QYaw(float yaw) { return { 0, std::sin(yaw / 2), 0, std::cos(yaw / 2) }; }
+
+// a hand's Rift pose, predicted `ahead` seconds, in the Rift's space
+vr::RigidBodyPosef Cv1Predict(const CV1Hand& h, double ahead) {
+    vr::RigidBodyPosef p{};
+    ahead = std::min(0.1, std::max(0.0, ahead));
+    vr::Quatf q{ h.orientation[0], h.orientation[1], h.orientation[2], h.orientation[3] };
+    vr::Vector3f w{ h.angularVelocity[0], h.angularVelocity[1], h.angularVelocity[2] };
+    float speed = std::sqrt(w.x * w.x + w.y * w.y + w.z * w.z);
+    float angle = speed * (float)ahead;
+    if (angle > 1e-6f) {   // world-space angular velocity: the turn goes on the left
+        float s = std::sin(angle / 2) / speed;
+        q = QMul({ w.x * s, w.y * s, w.z * s, std::cos(angle / 2) }, q);
+    }
+    p.Pose.Orientation = q;
+    p.Pose.Position = { h.position[0] + h.linearVelocity[0] * (float)ahead, h.position[1] + h.linearVelocity[1] * (float)ahead,
+                        h.position[2] + h.linearVelocity[2] * (float)ahead };
+    p.AngularVelocity = w;
+    p.LinearVelocity = { h.linearVelocity[0] + h.linearAcceleration[0] * (float)ahead, h.linearVelocity[1] + h.linearAcceleration[1] * (float)ahead,
+                         h.linearVelocity[2] + h.linearAcceleration[2] * (float)ahead };
+    p.AngularAcceleration = { h.angularAcceleration[0], h.angularAcceleration[1], h.angularAcceleration[2] };
+    p.LinearAcceleration = { h.linearAcceleration[0], h.linearAcceleration[1], h.linearAcceleration[2] };
+    return p;
+}
+
+// `space` in `base` at `seconds` (position and orientation both valid)
+bool LocateIn(XrSpace space, XrSpace base, double seconds, XrPosef& pose) {
+    if (!g.running || space == XR_NULL_HANDLE || base == XR_NULL_HANDLE) return false;
+    XrSpaceLocation loc{XR_TYPE_SPACE_LOCATION};
+    if (XR_FAILED(xrLocateSpace(space, base, ToXrTime(seconds), &loc))) return false;
+    const XrSpaceLocationFlags need = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT;
+    if ((loc.locationFlags & need) != need) return false;
+    pose = loc.pose;
+    return true;
+}
+
+// Rift space -> LOCAL (through the alignment and STAGE) at `seconds`
+void Cv1ToLocal(vr::RigidBodyPosef& p, double seconds) {
+    vr::Quatf r = QYaw(g_cv1.yaw);
+    vr::Vector3f off{ g_cv1.t[0], g_cv1.t[1], g_cv1.t[2] };
+    XrPosef stage;
+    if (g.stage != XR_NULL_HANDLE && LocateIn(g.stage, g.local, seconds, stage)) {
+        vr::Quatf sq{ stage.orientation.x, stage.orientation.y, stage.orientation.z, stage.orientation.w };
+        vr::Vector3f o = QRot(sq, off);
+        off = { o.x + stage.position.x, o.y + stage.position.y, o.z + stage.position.z };
+        r = QMul(sq, r);
+    }
+    vr::Vector3f pos = QRot(r, p.Pose.Position);
+    p.Pose.Position = { pos.x + off.x, pos.y + off.y, pos.z + off.z };
+    p.Pose.Orientation = QMul(r, p.Pose.Orientation);
+    p.LinearVelocity = QRot(r, p.LinearVelocity);
+    p.AngularVelocity = QRot(r, p.AngularVelocity);
+    p.LinearAcceleration = QRot(r, p.LinearAcceleration);
+    p.AngularAcceleration = QRot(r, p.AngularAcceleration);
+}
+
+// a Touch in a hand: a finger on a sensor, a button, the trigger or grip, or a turn of the wrist
+bool Cv1Held(const CV1Hand& h) {
+    if (!(h.bits & CV1_CONNECTED)) return false;
+    const uint32_t touch = CV1_TOUCH_PRIMARY | CV1_TOUCH_SECONDARY | CV1_TOUCH_STICK | CV1_TOUCH_TRIGGER | CV1_TOUCH_THUMBREST |
+                           CV1_PRIMARY | CV1_SECONDARY | CV1_STICK_CLICK | CV1_MENU;
+    float spin = h.angularVelocity[0] * h.angularVelocity[0] + h.angularVelocity[1] * h.angularVelocity[1] +
+                 h.angularVelocity[2] * h.angularVelocity[2];
+    return (h.bits & touch) || h.trigger > 0.05f || h.grip > 0.05f || spin > 0.5f * 0.5f;
+}
+
+bool QuestHeld(int hand) {
+    if (!g.session || !g.focused) return false;
+    return Bool(g.primaryTouch, hand) || Bool(g.secondaryTouch, hand) || Bool(g.stickTouch, hand) || Bool(g.triggerTouch, hand) ||
+           Bool(g.thumbrest, hand) || Float(g.trigger, hand) > 0.05f || Float(g.grip, hand) > 0.05f;
+}
+
+// Solves A x = b (n x n, n <= 9) by Gaussian elimination with partial pivoting; false if singular.
+bool SolveN(int n, double A[9][9], double b[9], double x[9]) {
+    for (int c = 0; c < n; ++c) {
+        int best = c;
+        for (int r = c + 1; r < n; ++r) if (std::fabs(A[r][c]) > std::fabs(A[best][c])) best = r;
+        if (std::fabs(A[best][c]) < 1e-9) return false;
+        std::swap(A[c], A[best]);
+        std::swap(b[c], b[best]);
+        for (int r = c + 1; r < n; ++r) {
+            double f = A[r][c] / A[c][c];
+            for (int k = c; k < n; ++k) A[r][k] -= f * A[c][k];
+            b[r] -= f * b[c];
+        }
+    }
+    for (int c = n - 1; c >= 0; --c) {
+        double v = b[c];
+        for (int k = c + 1; k < n; ++k) v -= A[c][k] * x[k];
+        x[c] = v / A[c][c];
+    }
+    return true;
+}
+
+vr::Quatf QConj(const vr::Quatf& q) { return { -q.x, -q.y, -q.z, q.w }; }
+
+// How far apart the Touch-to-hand turns are, for a yaw between the spaces: each hand turns as
+// yaw * touch * fixed (its own fixed), so with the right yaw, touch^-1 yaw^-1 hand is the same at
+// every sample of a hand.
+double Cv1Spread(const std::vector<vr::Quatf> touch[2], const std::vector<vr::Quatf> ref[2], float yaw) {
+    vr::Quatf inv = QConj(QYaw(yaw));
+    double spread = 0;
+    size_t n = 0;
+    for (int h = 0; h < 2; ++h) {
+        vr::Quatf first{};
+        for (size_t i = 0; i < touch[h].size(); ++i) {
+            vr::Quatf f = QMul(QMul(QConj(touch[h][i]), inv), ref[h][i]);
+            if (!i) first = f;
+            float d = std::fabs(f.x * first.x + f.y * first.y + f.z * first.z + f.w * first.w);
+            spread += 1 - std::min(1.0f, d);
+            ++n;
+        }
+    }
+    return n ? spread / n : 1;
+}
+
+// the yaw that keeps the Touch-to-hand turns constant (every 2 degrees, then finer)
+float Cv1BestYaw(const std::vector<vr::Quatf> touch[2], const std::vector<vr::Quatf> ref[2], double& spread) {
+    float best = 0;
+    spread = 1e30;
+    for (int i = 0; i < 180; ++i) {
+        double sp = Cv1Spread(touch, ref, i * 2 / 57.29578f);
+        if (sp < spread) { spread = sp; best = i * 2 / 57.29578f; }
+    }
+    for (float step = 1 / 57.29578f; step > 0.01f / 57.29578f; step /= 2)
+        for (float c : { best - step, best + step }) {
+            double sp = Cv1Spread(touch, ref, c);
+            if (sp < spread) { spread = sp; best = c; }
+        }
+    return best;
+}
+
+// The alignment from the tracks of both hands (a hand left out if it wasn't seen enough): for
+// each delay of the Rift's data (-150 to +100 ms), the yaw that keeps each Touch-to-hand turn
+// constant; the delay that fits best wins. Then the offset t (Rift -> STAGE) and where each Touch
+// sits on its palm, d[h], by least squares: yaw * touchAt + t = palmAt + palm * d[h].
+Cv1Result Cv1Solve(const std::vector<Cv1Raw> track[2]) {
+    Cv1Result r;
+    bool use[2];
+    for (int h = 0; h < 2; ++h) {
+        r.samples[h] = track[h].size();
+        use[h] = track[h].size() >= 60;
+    }
+    if (!use[0] && !use[1]) {
+        snprintf(r.why, sizeof r.why, "the hands weren't seen (left %zu, right %zu samples): keep them in front of you",
+                 r.samples[0], r.samples[1]);
+        return r;
+    }
+    std::vector<vr::Quatf> ref[2], touch[2];
+    for (int h = 0; h < 2; ++h) {
+        if (!use[h]) continue;
+        for (auto& sm : track[h]) {
+            ref[h].push_back(sm.head);
+            const vr::Quatf& a = track[h][0].head;
+            float d = std::fabs(a.x * sm.head.x + a.y * sm.head.y + a.z * sm.head.z + a.w * sm.head.w);
+            r.turned = std::max(r.turned, 2 * std::acos(std::min(1.0f, d)) * 57.29578f);
+        }
+        touch[h].resize(track[h].size());
+    }
+    if (r.turned < 30) { snprintf(r.why, sizeof r.why, "turn your wrists more (they turned %.0f degrees)", r.turned); return r; }
+    double bestSpread = 1e30;
+    for (int ms = -150; ms <= 100; ms += 10) {
+        for (int h = 0; h < 2; ++h)
+            for (size_t i = 0; use[h] && i < track[h].size(); ++i)
+                touch[h][i] = Cv1Predict(track[h][i].touch, track[h][i].t - track[h][i].received + ms / 1000.0).Pose.Orientation;
+        double sp;
+        float yaw = Cv1BestYaw(touch, ref, sp);
+        if (sp < bestSpread) { bestSpread = sp; r.yaw = yaw; r.lag = ms / 1000.0f; }
+    }
+    r.spread = (float)bestSpread;
+    // least squares: x = [t, d of each hand used]
+    int col[2] = { -1, -1 }, n = 3;
+    for (int h = 0; h < 2; ++h) if (use[h]) { col[h] = n; n += 3; }
+    vr::Quatf y = QYaw(r.yaw);
+    double A[9][9] = {}, b[9] = {};
+    std::vector<vr::Vector3f> at[2];
+    for (int h = 0; h < 2; ++h) {
+        if (!use[h]) continue;
+        at[h].resize(track[h].size());
+        for (size_t i = 0; i < track[h].size(); ++i) {
+            const Cv1Raw& sm = track[h][i];
+            at[h][i] = Cv1Predict(sm.touch, sm.t - sm.received + r.lag).Pose.Position;
+            vr::Vector3f rt = QRot(y, at[h][i]);
+            double rhs[3] = { sm.headAt.x - rt.x, sm.headAt.y - rt.y, sm.headAt.z - rt.z };
+            vr::Vector3f c[3] = { QRot(sm.head, { 1, 0, 0 }), QRot(sm.head, { 0, 1, 0 }), QRot(sm.head, { 0, 0, 1 }) };
+            for (int k = 0; k < 3; ++k) {
+                double row[9] = {};
+                row[k] = 1;
+                for (int j = 0; j < 3; ++j) row[col[h] + j] = -(k == 0 ? c[j].x : k == 1 ? c[j].y : c[j].z);
+                for (int i2 = 0; i2 < n; ++i2) {
+                    b[i2] += row[i2] * rhs[k];
+                    for (int j = 0; j < n; ++j) A[i2][j] += row[i2] * row[j];
+                }
+            }
+        }
+    }
+    double x[9];
+    if (!SolveN(n, A, b, x)) { snprintf(r.why, sizeof r.why, "turn your wrists more (every way)"); return r; }
+    for (int i = 0; i < 3; ++i) r.t[i] = (float)x[i];
+    double err = 0;
+    size_t count = 0;
+    float reach = 0;
+    for (int h = 0; h < 2; ++h) {
+        if (!use[h]) continue;
+        vr::Vector3f d{ (float)x[col[h]], (float)x[col[h] + 1], (float)x[col[h] + 2] };
+        r.d[h][0] = d.x; r.d[h][1] = d.y; r.d[h][2] = d.z;
+        reach = std::max(reach, std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z));
+        for (size_t i = 0; i < track[h].size(); ++i) {
+            const Cv1Raw& sm = track[h][i];
+            vr::Vector3f rt = QRot(y, at[h][i]), hd = QRot(sm.head, d);
+            double ex = rt.x + r.t[0] - sm.headAt.x - hd.x, ey = rt.y + r.t[1] - sm.headAt.y - hd.y, ez = rt.z + r.t[2] - sm.headAt.z - hd.z;
+            err += ex * ex + ey * ey + ez * ez;
+            ++count;
+        }
+    }
+    r.rms = (float)std::sqrt(err / count);
+    // turn spread 0.012 is about 18 degrees of wobble between a Touch and the tracked hand
+    if (r.spread > 0.012f) snprintf(r.why, sizeof r.why, "the hand tracking didn't follow the Touches (wobble %.3f)", r.spread);
+    else if (reach > 0.25f) snprintf(r.why, sizeof r.why, "a Touch came out %.0f cm from its hand", reach * 100);
+    else if (r.rms > 0.05f) snprintf(r.why, sizeof r.why, "error %.1f cm: move the hands more slowly", r.rms * 100);
+    else r.ok = true;
+    return r;
+}
+
+void Cv1WriteTrack(const std::vector<Cv1Raw> track[2]) {
+    FILE* f = fopen("/data/data/com.readyatdawn.r15/files/echoquestxr-cv1-samples.csv", "we");
+    if (!f) return;
+    fprintf(f, "hand,t,received,pqx,pqy,pqz,pqw,px,py,pz,status,tqx,tqy,tqz,tqw,tx,ty,tz,wx,wy,wz,vx,vy,vz\n");
+    for (int hand = 0; hand < 2; ++hand)
+        for (auto& r : track[hand]) {
+            const CV1Hand& h = r.touch;
+            fprintf(f, "%d,%.4f,%.4f,%.5f,%.5f,%.5f,%.5f,%.4f,%.4f,%.4f,%u,%.5f,%.5f,%.5f,%.5f,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+                    hand, r.t, r.received, r.head.x, r.head.y, r.head.z, r.head.w, r.headAt.x, r.headAt.y, r.headAt.z, h.status,
+                    h.orientation[0], h.orientation[1], h.orientation[2], h.orientation[3], h.position[0], h.position[1], h.position[2],
+                    h.angularVelocity[0], h.angularVelocity[1], h.angularVelocity[2], h.linearVelocity[0], h.linearVelocity[1], h.linearVelocity[2]);
+        }
+    fclose(f);
+}
+
+// solves on a thread of its own (it takes a few tens of ms); picked up on the next frame
+void Cv1SolveInBackground(std::vector<Cv1Raw> left, std::vector<Cv1Raw> right) {
+    g_cv1.solving = true;
+    std::thread([left = std::move(left), right = std::move(right)]() {
+        std::vector<Cv1Raw> track[2] = { left, right };
+        Cv1WriteTrack(track);
+        Cv1Result r = Cv1Solve(track);
+        {
+            std::lock_guard<std::mutex> l(g_cv1.resultLock);
+            g_cv1.result = r;
+            g_cv1.haveResult = true;
+        }
+        g_cv1.solving = false;
+    }).detach();
+}
+
+void Cv1TakeResult() {
+    Cv1Result r;
+    {
+        std::lock_guard<std::mutex> l(g_cv1.resultLock);
+        if (!g_cv1.haveResult) return;
+        g_cv1.haveResult = false;
+        r = g_cv1.result;
+    }
+    if (!r.ok) {
+        Cv1Buzz(0, 1, 0.8f);
+        Cv1Buzz(1, 1, 0.8f);
+        Cv1Status("couldn't align: %s", r.why);
+        return;
+    }
+    LOG("Rift Touch: alignment: %zu + %zu samples, wrists turned %.0f deg, wobble %.4f, delay %+.0f ms, error %.1f cm, "
+        "Touch in the left hand at %.3f %.3f %.3f m, right %.3f %.3f %.3f m", r.samples[0], r.samples[1], r.turned, r.spread,
+        r.lag * 1000, r.rms * 100, r.d[0][0], r.d[0][1], r.d[0][2], r.d[1][0], r.d[1][1], r.d[1][2]);
+    g_cv1.yaw = r.yaw; g_cv1.t[0] = r.t[0]; g_cv1.t[1] = r.t[1]; g_cv1.t[2] = r.t[2];
+    g_cv1.calibrated = true;
+    if (FILE* f = fopen(kCv1File, "we")) {
+        fprintf(f, "yaw=%.6f t=%.5f %.5f %.5f\n", r.yaw, r.t[0], r.t[1], r.t[2]);
+        fclose(f);
+    }
+    Cv1Buzz(0, 0.7f, 0.12f);
+    Cv1Buzz(1, 0.7f, 0.12f);
+    Cv1Status("aligned: error %.1f cm, delay %+.0f ms", r.rms * 100, r.lag * 1000);
+}
+
+// a tracked hand's palm in STAGE now
+bool PalmNow(int hand, double now, XrPosef& palm) {
+    if (!g.locateHandJoints || g.handTracker[hand] == XR_NULL_HANDLE || g.stage == XR_NULL_HANDLE || !g.running) return false;
+    XrHandJointsLocateInfoEXT li{XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT};
+    li.baseSpace = g.stage;
+    li.time = ToXrTime(now);
+    XrHandJointLocationEXT joints[XR_HAND_JOINT_COUNT_EXT];
+    XrHandJointLocationsEXT locs{XR_TYPE_HAND_JOINT_LOCATIONS_EXT};
+    locs.jointCount = XR_HAND_JOINT_COUNT_EXT;
+    locs.jointLocations = joints;
+    if (XR_FAILED(g.locateHandJoints(g.handTracker[hand], &li, &locs)) || !locs.isActive) return false;
+    const XrSpaceLocationFlags need = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT |
+                                      XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT | XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
+    const XrHandJointLocationEXT& p = joints[XR_HAND_JOINT_PALM_EXT];
+    if ((p.locationFlags & need) != need) return false;
+    palm = p.pose;
+    return true;
+}
+
+// once a frame: which controller each hand uses, and the alignment
+void Cv1Tick() {
+    if (g_cv1.tickFrame == g.submitted) return;
+    g_cv1.tickFrame = g.submitted;
+    Cv1Start();
+    SyncInput();
+    Cv1TakeResult();
+    CV1State st;
+    double received;
+    bool fresh = Cv1Get(st, received);
+    double now = Now();
+    for (int hand = 0; hand < 2; ++hand) {
+        bool use = g_cv1.useCv1[hand];
+        if (!fresh || !(st.hands[hand].bits & CV1_CONNECTED)) use = false;
+        else if (Cv1Held(st.hands[hand])) use = true;
+        else if (QuestHeld(hand)) use = false;
+        if (use != g_cv1.useCv1[hand]) {
+            g_cv1.useCv1[hand] = use;
+            LOG("Rift Touch: %s hand now uses the %s", hand ? "right" : "left", use ? "Rift Touch" : "Quest controller");
+        }
+    }
+    if (!fresh) return;
+    // asked to align: X, Y, A and B held together (a third of a second), or C in cv1bridge
+    bool ask = g_cv1.haveLastCalibrate && st.calibrate != g_cv1.lastCalibrate;
+    g_cv1.lastCalibrate = st.calibrate;
+    g_cv1.haveLastCalibrate = true;
+    const uint32_t both = CV1_PRIMARY | CV1_SECONDARY;
+    if ((st.hands[0].bits & both) == both && (st.hands[1].bits & both) == both) {
+        if (g_cv1.comboSince < 0) g_cv1.comboSince = now;
+        else if (now - g_cv1.comboSince > 0.33 && !g_cv1.comboUsed) { ask = true; g_cv1.comboUsed = true; }
+    } else {
+        g_cv1.comboSince = -1;
+        g_cv1.comboUsed = false;
+    }
+    if (ask && g_cv1.askedUntil < 0 && !g_cv1.solving) {
+        if (g.stage == XR_NULL_HANDLE) { Cv1Status("can't align: the Quest has no boundary set up"); return; }
+        if (!g.locateHandJoints) { Cv1Status("can't align: hand tracking isn't available (turn it on in the Quest's settings)"); return; }
+        g_cv1.asked[0].clear();
+        g_cv1.asked[1].clear();
+        g_cv1.askedUntil = now + 5;
+        Cv1Buzz(0, 0.6f, 0.15f);
+        Cv1Buzz(1, 0.6f, 0.15f);
+        Cv1Status("aligning: move both hands around, turning the wrists, for 5 seconds");
+    }
+    if (g_cv1.askedUntil < 0) return;
+    const uint32_t tracked = CV1_POSITION_TRACKED | CV1_ORIENTATION_TRACKED;
+    for (int hand = 0; hand < 2; ++hand) {
+        XrPosef palm;
+        if ((st.hands[hand].status & tracked) != tracked || !PalmNow(hand, now, palm)) continue;
+        g_cv1.asked[hand].push_back({ now, { palm.orientation.x, palm.orientation.y, palm.orientation.z, palm.orientation.w },
+                                      { palm.position.x, palm.position.y, palm.position.z }, st.hands[hand], received });
+    }
+    if (now < g_cv1.askedUntil) return;
+    g_cv1.askedUntil = -1;
+    Cv1SolveInBackground(g_cv1.asked[0], g_cv1.asked[1]);
+}
+
+// this hand uses its Rift Touch now: its newest state
+bool Cv1Active(int hand, CV1Hand& h, double& received) {
+    Cv1Tick();
+    if (!g_cv1.useCv1[hand]) return false;
+    CV1State st;
+    if (!Cv1Get(st, received)) return false;
+    h = st.hands[hand];
+    return true;
+}
+
 }  // namespace
 
 // ===========================================================================
@@ -2034,8 +2631,9 @@ EXPORT int32_t vrapi_Initialize(const vr::InitParms* p) {
     if ((g.hasTimespec = has(XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME))) exts.push_back(XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME);
     if ((g.hasRefreshRate = has(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME))) exts.push_back(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
     if ((g.hasFrameController = has("XR_VALVE_frame_controller_interaction"))) exts.push_back("XR_VALVE_frame_controller_interaction");
-    LOG("OpenXR extensions: timespec %d, refresh rate %d, Steam Frame controllers %d",
-        g.hasTimespec, g.hasRefreshRate, g.hasFrameController);
+    if ((g.hasHandTracking = has(XR_EXT_HAND_TRACKING_EXTENSION_NAME))) exts.push_back(XR_EXT_HAND_TRACKING_EXTENSION_NAME);
+    LOG("OpenXR extensions: timespec %d, refresh rate %d, Steam Frame controllers %d, hand tracking %d",
+        g.hasTimespec, g.hasRefreshRate, g.hasFrameController, g.hasHandTracking);
     if (!has(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME)) { LOGE("runtime has no XR_KHR_vulkan_enable"); return -1; }
 
     XrInstanceCreateInfoAndroidKHR android{XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR};
@@ -2064,6 +2662,10 @@ EXPORT int32_t vrapi_Initialize(const vr::InitParms* p) {
         GetProc("xrGetDisplayRefreshRateFB", &g.getRate);
         GetProc("xrRequestDisplayRefreshRateFB", &g.requestRate);
     }
+    if (g.hasHandTracking) {
+        GetProc("xrCreateHandTrackerEXT", &g.createHandTracker);
+        GetProc("xrLocateHandJointsEXT", &g.locateHandJoints);
+    }
 
     XrInstanceProperties ip{XR_TYPE_INSTANCE_PROPERTIES};
     xrGetInstanceProperties(g.instance, &ip);
@@ -2084,10 +2686,8 @@ EXPORT int32_t vrapi_Initialize(const vr::InitParms* p) {
     char guard[PROP_VALUE_MAX] = "";
     Option("semguard", guard);
     bool meta = strstr(ip.runtimeName, "Oculus") || strstr(ip.runtimeName, "Meta");
-    if (!meta) {
-        g.frameVelocity = EchoIntact();
-        if (!g.frameVelocity) LOG("controller adjustments off");
-    }
+    g.echoIntact = EchoIntact();
+    g.frameVelocity = !meta;
     g.semaphoreGuard = guard[0] ? guard[0] == '1' : !meta;
     LOG("semaphore guard: %s", g.semaphoreGuard ? "on" : "off");
     // How to flip: by fov on Meta's runtime (tested on Quest 3), by copy elsewhere. On Steam
@@ -2650,13 +3250,28 @@ EXPORT int32_t vrapi_GetCurrentInputState(void*, uint32_t deviceID, vr::InputSta
     s.TimeInSeconds = Now();
     s.BatteryPercent = 100;
     s.RecenterCount = g.recenterCount;
+    CV1Hand cv1;
+    double cv1At;
     if (g.session && g.focused) {
         bool left = hand == 0;
-        float trig = Float(g.trigger, hand), grip = Float(g.grip, hand);
-        XrVector2f stick = Vec2(g.stick, hand);
-        bool primary = Bool(g.primary, hand), secondary = Bool(g.secondary, hand), click = Bool(g.stickClick, hand);
-        bool tPrimary = Bool(g.primaryTouch, hand), tSecondary = Bool(g.secondaryTouch, hand);
-        bool tStick = Bool(g.stickTouch, hand), tTrigger = Bool(g.triggerTouch, hand), tRest = Bool(g.thumbrest, hand);
+        float trig, grip;
+        XrVector2f stick;
+        bool primary, secondary, click, menu, tPrimary, tSecondary, tStick, tTrigger, tRest;
+        if (Cv1Active(hand, cv1, cv1At)) {   // the Rift Touch in this hand
+            trig = cv1.trigger; grip = cv1.grip;
+            stick = { cv1.stickX, cv1.stickY };
+            primary = cv1.bits & CV1_PRIMARY; secondary = cv1.bits & CV1_SECONDARY;
+            click = cv1.bits & CV1_STICK_CLICK; menu = cv1.bits & CV1_MENU;
+            tPrimary = cv1.bits & CV1_TOUCH_PRIMARY; tSecondary = cv1.bits & CV1_TOUCH_SECONDARY;
+            tStick = cv1.bits & CV1_TOUCH_STICK; tTrigger = cv1.bits & CV1_TOUCH_TRIGGER; tRest = cv1.bits & CV1_TOUCH_THUMBREST;
+        } else {
+            trig = Float(g.trigger, hand); grip = Float(g.grip, hand);
+            stick = Vec2(g.stick, hand);
+            primary = Bool(g.primary, hand); secondary = Bool(g.secondary, hand); click = Bool(g.stickClick, hand);
+            menu = left && Bool(g.menu, hand);
+            tPrimary = Bool(g.primaryTouch, hand); tSecondary = Bool(g.secondaryTouch, hand);
+            tStick = Bool(g.stickTouch, hand); tTrigger = Bool(g.triggerTouch, hand); tRest = Bool(g.thumbrest, hand);
+        }
         s.IndexTrigger = trig;
         s.GripTrigger = grip;
         s.Joystick[0] = s.JoystickNoDeadZone[0] = s.TrackpadPosition[0] = stick.x;
@@ -2665,7 +3280,7 @@ EXPORT int32_t vrapi_GetCurrentInputState(void*, uint32_t deviceID, vr::InputSta
         if (primary) b |= left ? vr::kButtonX : vr::kButtonA;
         if (secondary) b |= left ? vr::kButtonY : vr::kButtonB;
         if (click) b |= vr::kButtonJoystick | (left ? vr::kButtonLThumb : vr::kButtonRThumb);
-        if (left && Bool(g.menu, hand)) b |= vr::kButtonEnter;
+        if (left && menu) b |= vr::kButtonEnter;
         if (trig > 0.1f) b |= vr::kButtonTrigger;
         if (grip > 0.1f) b |= vr::kButtonGrip;
         if (tPrimary) t |= left ? vr::kTouchX : vr::kTouchA;
@@ -2699,17 +3314,39 @@ EXPORT int32_t vrapi_GetInputTrackingState(void*, uint32_t deviceID, double seco
     if (latest) seconds = now;
     Hand& h = g.hands[hand];
     vr::RigidBodyPosef& p = out->HeadPose;
+    CV1Hand cv1;
+    double cv1At;
+    if (Cv1Active(hand, cv1, cv1At)) {
+        // the PC read it about 5 ms before it arrived
+        p = Cv1Predict(cv1, seconds - cv1At + 0.005);
+        Cv1ToLocal(p, seconds);
+        p.TimeInSeconds = seconds;
+        p.PredictionInSeconds = std::max(0.0, seconds - now);
+        uint32_t st = 0;
+        if (cv1.status & CV1_ORIENTATION_TRACKED) st |= vr::kOrientationTracked;
+        // While the sensors lose sight of a Touch (a flick), the Rift goes on from its motion
+        // sensors: the position stays valid, and Echo has to take it (and its speed) as tracked,
+        // as it does a Quest controller's, or it throws with a slow guess of its own
+        if (cv1.status & (CV1_POSITION_TRACKED | CV1_POSITION_VALID)) st |= vr::kPositionTracked;
+        if (cv1.status & CV1_ORIENTATION_VALID) st |= vr::kOrientationValid;
+        if (cv1.status & CV1_POSITION_VALID) st |= vr::kPositionValid;
+        out->Status = st;
+        const float speed = g_throw.touchSpeed, spin = g_throw.touchSpin;
+        p.LinearVelocity.x *= speed; p.LinearVelocity.y *= speed; p.LinearVelocity.z *= speed;
+        p.AngularVelocity.x *= spin; p.AngularVelocity.y *= spin; p.AngularVelocity.z *= spin;
+        return vr::kSuccess;
+    }
     if (Locate(g.useAimPose ? h.aim : h.grip, seconds, p, out->Status)) {
         if (!latest) {
             h.dispLinear = p.LinearVelocity;
             h.dispAngular = p.AngularVelocity;
             h.dispAsked = now;
             h.dispTime = seconds;
-        } else if (g.frameVelocity) {
+        } else if (ThrowActive()) {
             if (now - h.dispAsked < 0.05) {
                 vr::RigidBodyPosef at;
                 uint32_t st = 0;
-                if (Locate(g.useAimPose ? h.aim : h.grip, h.dispTime + kFrameVelLead, at, st)) {
+                if (Locate(g.useAimPose ? h.aim : h.grip, h.dispTime + g_throw.leadMs / 1000.0, at, st)) {
                     p.LinearVelocity = at.LinearVelocity;
                     p.AngularVelocity = at.AngularVelocity;
                 } else {
@@ -2717,12 +3354,12 @@ EXPORT int32_t vrapi_GetInputTrackingState(void*, uint32_t deviceID, double seco
                     p.AngularVelocity = h.dispAngular;
                 }
             }
-            p.LinearVelocity.x *= kFrameVelScale;
-            p.LinearVelocity.y *= kFrameVelScale;
-            p.LinearVelocity.z *= kFrameVelScale;
-            p.AngularVelocity.x *= kFrameAngScale;
-            p.AngularVelocity.y *= kFrameAngScale;
-            p.AngularVelocity.z *= kFrameAngScale;
+            p.LinearVelocity.x *= g_throw.speed;
+            p.LinearVelocity.y *= g_throw.speed;
+            p.LinearVelocity.z *= g_throw.speed;
+            p.AngularVelocity.x *= g_throw.spin;
+            p.AngularVelocity.y *= g_throw.spin;
+            p.AngularVelocity.z *= g_throw.spin;
         }
         // Echo asks several times a frame for nearly the same time; update on a real step
         double dt = seconds - h.lastTime;
@@ -2761,6 +3398,12 @@ EXPORT int32_t vrapi_SetHapticVibrationBuffer(void*, uint32_t deviceID, const vr
     uint32_t n = std::min<uint32_t>(buf->NumSamples, 1000);
     uint8_t peak = 0;
     for (uint32_t i = 0; buf->Samples && i < n; ++i) peak = std::max(peak, buf->Samples[i]);
+    CV1Hand cv1;
+    double cv1At;
+    if (Cv1Active(hand, cv1, cv1At)) {
+        Cv1Buzz(hand, peak / 255.f, n * 0.002f);
+        return vr::kSuccess;
+    }
     XrHapticActionInfo hi{XR_TYPE_HAPTIC_ACTION_INFO};
     hi.action = g.haptic;
     hi.subactionPath = g.hands[hand].path;

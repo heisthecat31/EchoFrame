@@ -90,6 +90,20 @@ def notices():
     return "\n\n".join(parts)
 
 
+def build_cv1bridge():
+    """cv1bridge.exe (Rift CV1 Touch over Wi-Fi), built with cv1bridge/build.cmd when the Oculus PC
+    SDK is there; an existing build otherwise. None (and a warning) if there's neither."""
+    exe = os.path.join(ROOT, "cv1bridge", "cv1bridge.exe")
+    try:
+        run(["cmd", "/d", "/c", os.path.join(ROOT, "cv1bridge", "build.cmd")])
+    except Exception as e:
+        print(f"cv1bridge not rebuilt ({e})")
+    if os.path.isfile(exe):
+        return exe
+    print("warning: no cv1bridge.exe: the release has no Rift Touch (needs the Oculus PC SDK, see cv1bridge/build.cmd)")
+    return None
+
+
 def main():
     if "--no-build" not in sys.argv:
         run([sys.executable, os.path.join(ROOT, "runtime", "build.py"), "--lib-only"])
@@ -109,6 +123,7 @@ def main():
         f.write(VERSION + "\n")
     name = f"EchoFrame-v{VERSION}"
     sep = os.pathsep
+    bridge = build_cv1bridge()
     patcher = os.path.join(ROOT, "patcher")
     run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--onefile", "--windowed",
          "--name", name, "--icon", ico, "--distpath", REL, "--workpath", os.path.join(work, "work"),
@@ -117,6 +132,7 @@ def main():
          "--add-data", f"{ico}{sep}.", *[a for px in (44, 55, 66, 88) for a in ("--add-data", f"{png[:-4]}-{px}.png{sep}.")],
          "--add-data", f"{png}{sep}.", "--add-data", f"{os.path.join(ROOT, 'patcher', 'art')}{sep}art", "--add-data", f"{version_file}{sep}.",
          "--hidden-import", "patch", "--hidden-import", "device", "--hidden-import", "axml", "--hidden-import", "buttons", "--hidden-import", "minidump", "--hidden-import", "frame_setup",
+         *(("--add-data", f"{bridge}{sep}.") if bridge else ()),
          os.path.join(patcher, "gui.pyw")])
     exe = os.path.join(REL, name + ".exe")
     zpath = os.path.join(REL, name + ".zip")

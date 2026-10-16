@@ -5,12 +5,13 @@ on OpenXR, on a Meta Quest or a Steam Frame.
 
 The steps (left) are pages: which headset, your APK, make the OpenXR version (patch.py; signed
 with your own random key, reused for your updates), connect the headset, install Echo and its
-game data, the Steam Frame's controls and sound (buttons.py), then play and save logs
-(device.py). Drawn on one Canvas in EchoXR's installer style (palette and gradient from
+game data, the Steam Frame's controls and sound (buttons.py) or, on a Quest, Rift CV1 Touch
+controllers over Wi-Fi (cv1bridge), then play and save logs (device.py). Drawn on one Canvas in EchoXR's installer style (palette and gradient from
 EchoXR's installer/ui.h).
 """
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -30,6 +31,7 @@ W, H = 1000, 710
 SIDE_W = 250
 CX, CW = 290, 670            # the page's content column
 TAGS = ("quest", "frame", "pick", "out", "go", "use", "skip", "folder", "details", "data", "connect", "getadb", "install",
+        "cv1", "cv1align", "cv1rumble",
         "launch", "logs", "back", "next", "advanced", "run", "q0", "q1", "q2", "q3", "q4", "step0", "step1", "step2", "step3", "step4", "step5", "step6")
 
 
@@ -75,6 +77,29 @@ def _write(name, text):
             f.write(text)
     except OSError:
         pass
+
+
+def cv1_pretty(line):
+    """cv1bridge's status line ("Echo running  222/s  left on tracked  right on  rumble 0") in words, and its colour."""
+    if not line:
+        return "Starting...", MUTED
+    hands = []
+    for side in ("left", "right"):
+        m = re.search(side + r" (on|off)( tracked)?", line)
+        if m:
+            hands.append(f"{side} " + ("tracked" if m.group(2) else "not seen" if m.group(1) == "on" else "off"))
+    link = ("Echo connected" if line.startswith("Echo running") else
+            "Echo stopped answering" if line.startswith("Echo not answering") else "Waiting for Echo on the Quest")
+    focus = "  (close other VR apps on the Rift)" if "no focus" in line else ""
+    ok = line.startswith("Echo running") and all(h.endswith("tracked") for h in hands)
+    return link + "  ·  Touches: " + ", ".join(hands) + focus, GOOD if ok else WARN
+
+
+def cv1bridge_exe():
+    """cv1bridge.exe: inside the release (PyInstaller's folder), else built beside the patcher; None if missing."""
+    here = getattr(sys, "_MEIPASS", None) or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cv1bridge")
+    exe = os.path.join(here, "cv1bridge.exe")
+    return exe if os.path.isfile(exe) else None
 
 
 class App(tk.Tk):
@@ -132,6 +157,11 @@ class App(tk.Tk):
         self.installed = False
         self.btn_map = buttons.load_local(device.DATA)   # Steam Frame controls and sound
         self.btn_panel = None
+        # Rift Touch: cv1bridge.exe, running while it's switched on (its output shown on the page)
+        self.cv1_proc = None
+        self.cv1_status = ""          # its status line
+        self.cv1_lines = []           # its last few messages
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.addr = tk.Entry(self, bg=CARD_HI, fg=TEXT, insertbackground=TEXT, relief="flat", bd=0,
                              highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT,
                              font=("Consolas", -self.px(14)))
@@ -233,6 +263,8 @@ class App(tk.Tk):
              ("Install", self.page_install)]
         if self.headset == "frame":
             s.append(("Button layout", self.page_controls))
+        else:
+            s.append(("Rift Touch", self.page_cv1))
         s.append(("Play", self.page_play))
         return s
 
@@ -496,6 +528,97 @@ class App(tk.Tk):
         ok, _ = self.device_ready()
         self.btn_panel.set_can_save(ok and not self.dev_busy)
         self.cv.create_window(self.px(CX + (CW - buttons.PANEL_W) / 2), self.px(110), window=self.btn_panel, anchor="nw")
+
+    def page_cv1(self):
+        on = self.cv1_proc is not None
+        self.text(CX, 104, "Play with Rift CV1 Touch controllers on the standalone Quest. The Rift and its sensors stay "
+                           "plugged into this PC; EchoFrame reads the Touches and sends them to Echo over Wi-Fi (this PC "
+                           "and the Quest on the same network). Optional: the Quest's own controllers work as before.",
+                  "body", MUTED, width=CW)
+        y = 184
+        self.button(CX, y, 220, 48, "Stop Rift Touch" if on else "Start Rift Touch", "cv1", primary=not on,
+                    enabled=on or bool(cv1bridge_exe()))
+        self.button(CX + 240, y, 160, 48, "Align", "cv1align", enabled=on)
+        self.button(CX + 420, y, 160, 48, "Test rumble", "cv1rumble", enabled=on)
+        y += 64
+        self.rrect(CX, y, CW, 92, 14, CARD, outline=BORDER)
+        if not cv1bridge_exe():
+            line, tint = "cv1bridge.exe isn't in this copy of EchoFrame.", BAD
+        elif not on:
+            line, tint = "Off.", MUTED
+        else:
+            line, tint = cv1_pretty(self.cv1_status)
+        self.status(CX + 20, y + 16, line, tint, width=CW - 40)
+        for i, msg in enumerate(self.cv1_lines[-2:]):
+            self.text(CX + 20, y + 44 + 20 * i, msg, "small", MUTED, width=CW - 40)
+        y += 108
+        self.rrect(CX, y, CW, 214, 16, CARD, outline=BORDER)
+        self.text(CX + 20, y + 16, "HOW", "label", FAINT)
+        self.bullets(CX + 20, y + 44, [
+            "Put a bit of tape over the Rift's proximity sensor (inside, above the nose), so it tracks the Touches "
+            "without being worn. Don't run another VR app on the Rift.",
+            "Start Rift Touch here, then start Echo on the Quest with its controllers off (it opens on hand tracking).",
+            "Pick up the Touches: Echo uses them straight away, and the Quest's controllers again when you pick those up.",
+            "First time: press X, Y, A and B together (or Align), then move both hands around, turning your wrists, "
+            "for 5 seconds. The Quest remembers it.",
+        ], width=CW - 40)
+
+    def cv1_start(self):
+        exe = cv1bridge_exe()
+        if not exe or self.cv1_proc:
+            return
+        self.cv1_status, self.cv1_lines = "", []
+        try:
+            proc = subprocess.Popen([exe], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    cwd=os.path.dirname(exe), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except OSError as e:
+            self.cv1_lines = [f"Couldn't start cv1bridge: {e}"]
+            return
+        self.cv1_proc = proc
+        def read():
+            line = b""
+            while True:
+                c = proc.stdout.read(1)
+                if not c:
+                    break
+                if c in b"\r\n":
+                    if line.strip():
+                        self.msgs.put(("cv1", line.decode("utf-8", "replace").strip()))
+                    line = b""
+                else:
+                    line += c
+            self.msgs.put(("cv1_end", proc.wait()))
+        threading.Thread(target=read, daemon=True).start()
+
+    def cv1_send(self, key):
+        if self.cv1_proc:
+            try:
+                self.cv1_proc.stdin.write(key)
+                self.cv1_proc.stdin.flush()
+            except OSError:
+                pass
+
+    def cv1_stop(self):
+        proc, self.cv1_proc = self.cv1_proc, None
+        if not proc:
+            return
+        self.cv1_send_to(proc, b"q")
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+    @staticmethod
+    def cv1_send_to(proc, key):
+        try:
+            proc.stdin.write(key)
+            proc.stdin.flush()
+        except OSError:
+            pass
+
+    def on_close(self):
+        self.cv1_stop()
+        self.destroy()
 
     def page_play(self):
         ok, dev = self.device_ready()
@@ -804,6 +927,15 @@ class App(tk.Tk):
             self.details = not self.details
         elif t == "data" and not self.dev_busy:
             self.with_data = not self.with_data
+        elif t == "cv1":
+            if self.cv1_proc:
+                self.cv1_stop()
+            else:
+                self.cv1_start()
+        elif t == "cv1align":
+            self.cv1_send(b"c")
+        elif t == "cv1rumble":
+            self.cv1_send(b"h")
         elif t in ("getadb", "connect", "install", "launch", "logs") and not self.dev_busy:
             self.headset_click(t)
         self.draw()
@@ -917,6 +1049,18 @@ class App(tk.Tk):
                 self.state, self.result = "done", v
             elif kind == "error":
                 self.state, self.message = "error", v
+            elif kind == "cv1":
+                status = v.startswith(("Echo running", "Echo not answering", "no Quest yet"))
+                if status:
+                    self.cv1_status = v
+                elif not v.startswith(("cv1bridge:", "waiting for Echo")):
+                    self.cv1_lines = (self.cv1_lines + [v])[-4:]
+                changed = True
+            elif kind == "cv1_end":
+                if self.cv1_proc and self.cv1_proc.poll() is not None:
+                    self.cv1_proc = None
+                    self.cv1_lines = (self.cv1_lines + [f"cv1bridge stopped (exit code {v})."])[-4:]
+                changed = True
             elif kind == "buttons_saved":
                 if self.btn_panel:
                     self.btn_panel.show_status(v[1], GOOD if v[0] else WARN)
