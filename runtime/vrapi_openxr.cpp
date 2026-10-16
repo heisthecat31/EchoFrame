@@ -17,7 +17,6 @@
 //   PollEvent                          session state -> visibility/focus events
 //
 // Logs to logcat under EchoQuestXR. Properties, read at startup:
-//   debug.echoquestxr.pose grip      controllers from the grip pose (default: aim, which matches VrApi)
 //   debug.echoquestxr.flip 0|fov|copy   VrApi's images are bottom-up. fov: flip them by
 //                                    submitting an upside-down field of view (default on Meta's
 //                                    runtime); copy: copy each frame upside down into a second
@@ -2588,9 +2587,7 @@ EXPORT int32_t vrapi_Initialize(const vr::InitParms* p) {
     if (!p || !p->java.Vm) return -1;
     static bool watching = false;
     if (!watching) { watching = true; std::thread(HangWatch).detach(); }
-    char pose[PROP_VALUE_MAX] = "";
-    Option("pose", pose);
-    g.useAimPose = strcmp(pose, "grip") != 0;   // aim matches VrApi's controller pose (tested on Quest 3)
+    g.useAimPose = true;   // aim matches VrApi's controller pose (tested on Quest 3)
     Option("flip", g_flipOption);
     g.flipY = strcmp(g_flipOption, "0") != 0;
     char fovProp[PROP_VALUE_MAX] = "";
