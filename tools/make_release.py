@@ -23,8 +23,9 @@ OPENXR_SDK = os.environ.get("OPENXR_SDK", os.path.join(ROOT, "..", "EchoVR-Hand-
 
 README = """EchoFrame v{version}
 ==========================
-Makes your Echo VR Quest APK run on OpenXR: on Quest (Meta's OpenXR runtime) and,
-untested so far, on Steam Frame and other OpenXR headsets.
+Makes your Echo VR Quest APK run on OpenXR: on Quest (Meta's OpenXR runtime), on a
+Steam Frame, and on Pico (new, not tried on a Pico yet). On a Quest it can also use
+Rift CV1 Touch controllers over Wi-Fi (the Rift Touch step; cv1bridge.exe is inside).
 
 1. Run EchoFrame-v{version}.exe (Windows may warn about an unknown
    publisher: More info -> Run anyway).
@@ -46,6 +47,13 @@ untested so far, on Steam Frame and other OpenXR headsets.
      it installs Lepton from Steam if needed, adds Echo VR to the Steam library, and
      starts Echo once to make its data folder (keep the headset awake). Frame Control
      isn't needed; the set-up is the same as Frame Control's (MIT, saphid).
+   - Pico (Pico 4, 4 Ultra, Neo 3): choose Pico in step 1. Turn on Developer Mode
+     (Settings > General > About: tap Software Version 7 times, then Settings >
+     Developer: USB debugging on) and plug in with USB. Not tried on a Pico yet: if
+     something's wrong, Save logs and send the file.
+   - Rift CV1 Touch (Quest): the Rift Touch step runs cv1bridge on this PC, with the
+     Rift and its sensors plugged in and the Oculus app running. Line the Rift up with
+     the Quest once: press X, Y, A and B together, then move both hands for 5 seconds.
 
 Game data: with "Install also copies Echo's game data" ticked (the default), Install
 also downloads Echo's game data (about 900 MB, once; from the same mirrors as the
@@ -60,9 +68,11 @@ platform-tools) installs itself when the window opens.
 The patch changes three things in the APK: lib/arm64-v8a/libvrapi.so (VrApi on
 OpenXR), lib/arm64-v8a/libopenxr_loader.so (Khronos OpenXR loader) and the manifest
 (launcher entry for Steam Frame, OpenXR permissions). The Steam Frame build also
-changes libr15.so and libassetpatch.so (game data folder, Vulkan fixes) and replaces
-lib/arm64-v8a/libovrplatformloader.so with a stand-in for Meta's Platform SDK, which
-the Frame doesn't have. Everything else is copied as is.
+changes libr15.so and libassetpatch.so (game data folder, Vulkan fixes); the Steam Frame
+and Pico builds replace lib/arm64-v8a/libovrplatformloader.so with a stand-in for Meta's
+Platform SDK, which they don't have (the Pico build also adds Pico's VR launch entries
+to the manifest). Everything else is copied as is. EchoFrame doesn't change how throwing
+works: controller speeds go to Echo as the headset reports them.
 """
 
 

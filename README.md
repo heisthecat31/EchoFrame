@@ -3,9 +3,9 @@
 <img src="patcher/echoframe.png" width="96" align="right">
 
 **EchoFrame** (EchoQuestXR inside: its runtime, log tags and files keep that name) runs the
-**Echo VR Quest APK on OpenXR**: on Quest through Meta's OpenXR runtime, and
-aimed at standalone Steam Frame (through Valve's Lepton Android container) and other
-OpenXR headsets.
+**Echo VR Quest APK on OpenXR**: on Quest through Meta's OpenXR runtime, on a standalone
+Steam Frame (through Valve's Lepton Android container), and on Pico (new, untested). A Quest
+build can also play with **Rift CV1 Touch controllers** over Wi-Fi.
 
 Echo's Quest build talks to the headset through Meta's **VrApi** (`libvrapi.so`, loader
 1.1.40), which only works on Meta's own runtime. EchoQuestXR replaces that one library
@@ -23,19 +23,23 @@ This repository ships **no game files, no APKs and no logs**. You supply your ow
 | 2. Button layout (press each button once) | ✅ same document |
 | 3. `libvrapi.so` on OpenXR, on Quest 3 | ✅ plays: view, head tracking, hands, every button, throwing |
 | 4. Package for Lepton and test on Steam Frame | ✅ plays in matches: view, head and hand tracking, the Frame's controllers (button layout in the window), voice chat both ways; 72 fps in menus, 60-72 in matches |
+| 5. Rift CV1 Touch on a standalone Quest (`cv1bridge`) | ✅ (0.6.0) |
+| 6. Pico (PICO OS) | built, not tried on a Pico yet (0.6.6) |
 
 Tested on a Quest 3 (Horizon OS, Meta OpenXR runtime 85) and a Steam Frame (SteamOS, SteamVR,
-Lepton) with Echo VR build 4987566.
+Lepton) with Echo VR build 4987566. Controller velocities go to Echo as the OpenXR runtime
+reports them: EchoFrame doesn't tune or boost throwing.
 
 ## Patching your APK (`patcher/`)
 
-A step-by-step window (your headset, your APK, make it, connect, install, button layout on
-the Frame, play): choose your Echo VR APK, and it writes a patched copy next to it.
+A step-by-step window (your headset: Quest, Steam Frame or Pico; your APK, make it, connect,
+install, button layout on the Frame, Rift Touch on a Quest, play): choose your Echo VR APK, and
+it writes a patched copy next to it.
 **Advanced** (bottom left) is a terminal on the headset (adb shell; SteamOS on a Frame).
 
 ```bash
 pip install -r patcher/requirements.txt
-pythonw patcher/gui.pyw            # or: python patcher/patch.py <echo.apk>
+pythonw patcher/gui.pyw            # or: python patcher/patch.py <echo.apk> [--frame | --pico]
 ```
 
 A Quest build can also take the Steam Frame's microphone path (command line only):
@@ -49,8 +53,19 @@ Touches from the Oculus runtime and sends them over Wi-Fi to Echo on the Quest, 
 second; Echo's rumble goes back. Echo starts on hand tracking (the build declares it), uses a
 Touch the moment it's picked up and the Quest's own controller when that's picked up instead.
 The Rift's space is aligned to the Quest's once, with the Quest's hand tracking: press X, Y, A
-and B together, then move both hands around for five seconds (saved on the Quest). Building
-`cv1bridge` needs the Oculus PC SDK (`cv1bridge/build.cmd`).
+and B together, then move both hands around for five seconds (saved on the Quest); the hand
+trackers are open only for that. When the Rift's sensors briefly lose a Touch, `cv1bridge`
+keeps sending its last velocity for up to 150 ms. Building `cv1bridge` needs the Oculus PC
+SDK (`cv1bridge/build.cmd`); a release bundles `cv1bridge.exe`.
+
+**Pico** (**Pico** in the window, `patch.py --pico`; new, not tried on a Pico yet): the Platform
+SDK stand-in (PICO OS has no Meta services), and Pico's VR launch entries in the manifest
+(`pvr.app.type=vr` meta-data and the `com.picovr.intent.category.VR` category; without them
+Pico's launcher opens Echo as a 2D window). Game data stays in
+`/sdcard/Android/media/com.readyatdawn.r15`, as on a Quest. The runtime binds the Pico 4 and
+Neo 3 controllers (`XR_BD_controller_interaction`), keeps the refresh rate at 72 Hz (90
+stuttered), asks for sustained-high CPU and GPU levels (`XR_EXT_performance_settings`), and the
+stand-in's microphone gets no +6 dB (a Pico's microphone is louder).
 
 It makes three changes: `lib/arm64-v8a/libvrapi.so` becomes the EchoQuestXR runtime,
 `lib/arm64-v8a/libopenxr_loader.so` (the Khronos OpenXR loader) is added, and the manifest
@@ -81,17 +96,18 @@ adb (Google's platform-tools) installs itself when the window opens, into
 adb install <your-echo>_openxr.apk
 ```
 
-The patcher needs the two runtime libraries: in `patcher/runtime/` (a release puts them
-there), or built from source into `build/` (below).
+The patcher needs the runtime libraries (`libvrapi.so`, `libopenxr_loader.so` and the Platform
+SDK stand-in `libovrplatformloader.so`): in `patcher/runtime/` (a release puts them there), or
+built from source into `build/` (below).
 
 ## Windows release
 
 ```bash
-python tools/make_release.py        # build/release/EchoQuestXR-Patcher-v<VERSION>.exe and .zip
+python tools/make_release.py        # build/release/EchoFrame-v<VERSION>.exe and .zip
 ```
 
-A standalone `.exe` (PyInstaller): the patcher window with the runtime libraries inside, so
-users need nothing else. The zip adds README.txt and THIRD_PARTY_NOTICES.txt. Needs
+A standalone `.exe` (PyInstaller): the patcher window with the runtime libraries and
+`cv1bridge.exe` inside (when it could be built), so users need nothing else. The zip adds README.txt and THIRD_PARTY_NOTICES.txt. Needs
 everything the runtime build needs, plus `cryptography`, Pillow and PyInstaller. The version
 is in `VERSION`.
 
@@ -101,7 +117,7 @@ Needs the Android NDK (default `J:\AndroidSDK`, or set `ANDROID_HOME`), CMake, N
 OpenXR SDK source (`OPENXR_SDK`, default: EchoXR's `xr/OpenXR-SDK` checkout).
 
 ```bash
-python runtime/build.py --lib-only                              # build/libvrapi.so, libopenxr_loader.so, libovrplatformloader.so
+python runtime/build.py --lib-only                              # build/libvrapi.so, libopenxr_loader.so, libovrplatformloader.so, libcustgd.so
 python runtime/build.py --apk <echo.apk> --ks <keystore>        # also a test APK signed with your key
 ```
 
@@ -112,8 +128,9 @@ time. Things worth knowing:
 - **Foveation maps.** Echo always renders with a fragment density map for each swapchain
   image, so the runtime makes real ones (full density) and enables `VK_EXT_fragment_density_map`.
   Without them the GPU silently drops Echo's rendering.
-- **Image orientation.** VrApi's images are bottom-up; the runtime flips them by swapping
-  each eye's up and down field-of-view angles.
+- **Image orientation.** VrApi's images are bottom-up. On Meta's runtime the runtime flips
+  them by swapping each eye's up and down field-of-view angles; elsewhere (Steam Frame) it
+  copies them upright, since an upside-down field of view left everything too high there.
 - **Controllers** use the OpenXR aim pose, which matches VrApi's.
 - **Swapchain images.** Echo picks its image round-robin itself; the runtime keeps OpenXR's
   acquire order in step with it.
@@ -122,10 +139,23 @@ Properties (read when Echo starts; `adb shell setprop <name> <value>`):
 
 | Property | Effect |
 | --- | --- |
-| `debug.echoquestxr.pose grip` | controllers from the grip pose instead of aim |
-| `debug.echoquestxr.flip 0` | don't flip the images |
+| `debug.echoquestxr.flip 0` / `fov` / `copy` | don't flip the images / flip by field of view / by copy |
+| `debug.echoquestxr.fov openxr` | submit OpenXR's field of view instead of the one Echo rendered with |
 | `debug.echoquestxr.test red` / `probe` / `redprobe` | display-path diagnostics |
-| `debug.echoquestxr.semguard 0` / `1` | semaphore guard off / on (default: on except on Meta's runtime) |
+| `debug.echoquestxr.semguard 0` / `1` | semaphore guard off / on (default: on except on Meta's runtime and Pico) |
+| `debug.echoquestxr.customguard 0` | customization guard off |
+
+The **customization guard** (`runtime/customization_guard.h`): each player's cosmetics go in
+a table whose growth asks the allocator for room and never checks the answer, so when Echo was
+out of memory (full lobbies, seen on Quest) it wrote the new entry at address 0 and crashed.
+The guard takes that growth function's slot in `libr15.so`'s GOT: it does the resize itself
+and, when that fails, leaves the table empty and safe, so that player's cosmetics just aren't
+drawn. It's in the runtime; for an APK whose `libvrapi.so` is someone else's,
+`tools/add_custguard.py` adds it as `libcustgd.so` (output unsigned).
+
+`runtime/vrapi_handflip_shim.c` is a separate `libvrapi.so` shim for a runtime build without
+source: on a Quest 2 it rolls the controller poses 180 degrees about their pointing axis
+(`files/afk/handflip.on` / `handflip.off` override it).
 
 The **semaphore guard**: Mesa (Steam Frame), in its threaded submit mode, blocks inside
 `vkQueueSubmit` until every binary semaphore the submit waits on has its signal in the
@@ -135,7 +165,8 @@ acquire and destroy entries in Echo's Vulkan function table for wrappers that dr
 semaphores signaled on the same queue (and on ones nothing signaled), keeping waits on
 window-image acquires. It logs the first 60 calls in full (`semaphore guard: ...`).
 
-Logs: `adb logcat -s EchoQuestXR`. If Echo stops polling VrApi for 4 seconds (a hang), the
+Logs: `adb logcat -s EchoQuestXR` (Save logs also keeps Pico's `APxrRuntime` and
+`PxrCompositor` lines). If Echo stops polling VrApi for 4 seconds (a hang), the
 runtime logs where each of Echo's threads is (`hang: ...` lines: library + offset, and the
 function name where the library exports one), at most 3 times per run.
 
@@ -152,7 +183,7 @@ Sign it with the key of the copy installed on the headset so it installs as an u
 
 ## Steam Frame
 
-Ready on the EchoQuestXR side, untested on a Frame:
+Plays in matches (step 4 above). What it takes:
 - Lepton packaging: `LAUNCHER` entry and OpenXR permissions in the manifest (`patcher/axml.py`);
   OpenXR 1.0 only; refresh-rate requests are optional.
 - Vulkan: extensions the driver lacks are left out (logged), so device creation can't fail
@@ -202,10 +233,14 @@ exports the same 1154 C functions; the 175 Echo's provider (`libpnsovr.so`) call
 locally: the Platform SDK starts, the entitlement check passes (an error there makes Echo
 exit), the logged-in user, user proof and access token come back for a stand-in user, and
 friends, purchases and invites come back empty. Rooms and Meta's invite, friend and checkout
-panels get "not available" errors, which Echo logs and carries on from. The microphone and
-VoIP give silence. Echo still logs in to the community servers with its own `config.json` (the
-community build hard-codes the Platform SDK user ID it sends). The stand-in logs each request
-type once as `EchoQuestXR: Platform SDK: ...`. The Quest build keeps Meta's loader.
+panels get "not available" errors, which Echo logs and carries on from. The microphone is
+real: AAudio capture with a 100 Hz high-pass, +6 dB and a soft limiter, handed to Echo in whole
+Opus frames (with `libpnsovr.so`'s MicAvailable patched 960 -> 2880 so a slow frame can take a
+40 ms one); incoming voice never needed the Platform SDK. The user ID and name come from
+`files/afk/user.txt` when the installer writes it (a built-in user otherwise), and the access
+token isn't empty, so Echo goes on to its community-server login with its own `config.json`. The stand-in logs each request
+type once as `EchoQuestXR: Platform SDK: ...`. The Quest build keeps Meta's loader (unless
+made with `--standin-mic`); the Pico build uses the stand-in too.
 
 The runtime finds out which device extensions the driver has with a throwaway Vulkan
 instance, made before Echo's own: Lepton loads Valve's `fdm_injection` and `fossilize`
