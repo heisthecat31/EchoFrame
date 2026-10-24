@@ -15,3 +15,6 @@ __pycache__/
 *.dmp
 # adb the patcher downloads (Google platform-tools)
 patcher/platform-tools/
+# cv1bridge.exe is built by cv1bridge/build.cmd (needs the Oculus PC SDK)
+cv1bridge/*.exe
+cv1bridge/*.obj

@@ -38,6 +38,20 @@ pip install -r patcher/requirements.txt
 pythonw patcher/gui.pyw            # or: python patcher/patch.py <echo.apk>
 ```
 
+A Quest build can also take the Steam Frame's microphone path (command line only):
+`--standin-mic` (the Platform SDK stand-in's microphone: 100 Hz high-pass, +6 dB with a soft
+limiter, whole Opus frames, and `libpnsovr.so`'s MicAvailable 960 -> 2880; Meta's Platform SDK
+is replaced, so Meta's friends, party and invite features are gone).
+
+**Rift CV1 Touch on a standalone Quest.** A Quest build can use Rift CV1 Touch controllers: the
+Rift and its sensors stay on a PC, where `cv1bridge` (EchoFrame's Rift Touch step) reads the
+Touches from the Oculus runtime and sends them over Wi-Fi to Echo on the Quest, about 250 times a
+second; Echo's rumble goes back. Echo starts on hand tracking (the build declares it), uses a
+Touch the moment it's picked up and the Quest's own controller when that's picked up instead.
+The Rift's space is aligned to the Quest's once, with the Quest's hand tracking: press X, Y, A
+and B together, then move both hands around for five seconds (saved on the Quest). Building
+`cv1bridge` needs the Oculus PC SDK (`cv1bridge/build.cmd`).
+
 It makes three changes: `lib/arm64-v8a/libvrapi.so` becomes the EchoQuestXR runtime,
 `lib/arm64-v8a/libopenxr_loader.so` (the Khronos OpenXR loader) is added, and the manifest
 gets a `LAUNCHER` entry plus the OpenXR permissions (Lepton on Steam Frame needs the first;

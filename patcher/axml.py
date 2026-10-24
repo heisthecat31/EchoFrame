@@ -4,6 +4,8 @@ Binary XML is a file header, a string pool, a resource-id map for attribute name
 stream of element records that refer to strings by index. Supported edits:
   replace_string(old, new)      change a string's text everywhere it's used
   add_uses_permission(name)     add <uses-permission android:name="..."/> after the last one
+  add_uses_feature(name)        add <uses-feature android:name="..." android:required="false"/>
+  clone_element(tag, name, values)  copy an element that has no children, changing string attributes
 Strings are only appended to the pool, so every existing index stays valid.
 """
 import struct
@@ -123,6 +125,106 @@ class Manifest:
         self.rest = self.rest[:at] + bytes(start) + end + self.rest[at:]
         return True
 
+    def _feature_named(self, name):
+        i = self.index(name)
+        if i < 0:
+            return False
+        for o, t, size in self._chunks():
+            if t == RES_START_ELEMENT and self.strings[struct.unpack_from("<I", self.rest, o + 20)[0]] == "uses-feature":
+                count = struct.unpack_from("<H", self.rest, o + 28)[0]
+                for a in range(count):
+                    if struct.unpack_from("<I", self.rest, o + 36 + 20 * a + 8)[0] == i:
+                        return True
+        return False
+
+    def add_uses_feature(self, name):
+        """Clones a named <uses-feature> (start and end records) as <uses-feature android:name=name
+        android:required="false"/>, put after it. Attributes other than name and required are left out."""
+        if self._feature_named(name):
+            return False
+        chunks = self._chunks()
+        for k, (o, t, size) in enumerate(chunks):
+            if t != RES_START_ELEMENT or self.strings[struct.unpack_from("<I", self.rest, o + 20)[0]] != "uses-feature":
+                continue
+            count = struct.unpack_from("<H", self.rest, o + 28)[0]
+            attrs = [bytearray(self.rest[o + 36 + 20 * a:o + 56 + 20 * a]) for a in range(count)]
+            names = [self.strings[struct.unpack_from("<I", a, 4)[0]] for a in attrs]
+            if "name" not in names or "required" not in names:
+                continue
+            end = chunks[k + 1]
+            if end[1] != RES_END_ELEMENT:
+                raise AxmlError("a <uses-feature> with children isn't supported")
+            idx = self.add_string(name)
+            keep = []
+            for a, n in zip(attrs, names):
+                if n == "name":
+                    struct.pack_into("<I", a, 8, idx)
+                    struct.pack_into("<I", a, 16, idx)
+                elif n == "required":
+                    struct.pack_into("<I", a, 16, 0)          # boolean false
+                else:
+                    continue
+                keep.append(bytes(a))
+            head = bytearray(self.rest[o:o + 36])
+            struct.pack_into("<I", head, 4, 36 + 20 * len(keep))   # chunk size
+            struct.pack_into("<H", head, 28, len(keep))            # attribute count
+            start = bytes(head) + b"".join(keep)
+            eo, esize = end[0], end[2]
+            at = eo + esize
+            self.rest = self.rest[:at] + start + self.rest[eo:eo + esize] + self.rest[at:]
+            return True
+        raise AxmlError("the manifest has no named <uses-feature> to copy")
+
+    def _attrs(self, o):
+        """[(attribute name, string value or None)] of the start element at offset o."""
+        out = []
+        for a in range(struct.unpack_from("<H", self.rest, o + 28)[0]):
+            an, raw = struct.unpack_from("<II", self.rest, o + 36 + 20 * a + 4)
+            out.append((self.strings[an], self.strings[raw] if raw != 0xFFFFFFFF else None))
+        return out
+
+    def has_element(self, tag, **values):
+        """Whether an element <tag> has every attribute given (name=value, all strings)."""
+        for o, t, size in self._chunks():
+            if t == RES_START_ELEMENT and self.strings[struct.unpack_from("<I", self.rest, o + 20)[0]] == tag:
+                attrs = dict(self._attrs(o))
+                if all(attrs.get(k) == v for k, v in values.items()):
+                    return True
+        return False
+
+    def clone_element(self, tag, name, values):
+        """Copies the first <tag android:name=name> (an element without children: its start and
+        end records) and puts the copy right after it, with the string attributes in values
+        (attribute name -> new text) changed. Returns False if an element with those values is
+        there already."""
+        if self.has_element(tag, **values):
+            return False
+        chunks = self._chunks()
+        for k, (o, t, size) in enumerate(chunks):
+            if t != RES_START_ELEMENT or self.strings[struct.unpack_from("<I", self.rest, o + 20)[0]] != tag:
+                continue
+            if dict(self._attrs(o)).get("name") != name:
+                continue
+            end = chunks[k + 1]
+            if end[1] != RES_END_ELEMENT:
+                raise AxmlError(f"a <{tag}> with children isn't supported")
+            start = bytearray(self.rest[o:o + size])
+            for a in range(struct.unpack_from("<H", start, 28)[0]):
+                at = 36 + 20 * a
+                an, raw = struct.unpack_from("<II", start, at + 4)
+                key = self.strings[an]
+                if key in values:
+                    if raw == 0xFFFFFFFF:
+                        raise AxmlError(f"<{tag}> {key} isn't a string")
+                    idx = self.add_string(values[key])
+                    struct.pack_into("<I", start, at + 8, idx)        # raw value
+                    struct.pack_into("<I", start, at + 16, idx)       # typed value (a string index)
+            eo, esize = end[0], end[2]
+            here = eo + esize
+            self.rest = self.rest[:here] + bytes(start) + self.rest[eo:eo + esize] + self.rest[here:]
+            return True
+        raise AxmlError(f"the manifest has no <{tag} android:name=\"{name}\"> to copy")
+
     # ------------------------------------------------------------------ writing
     def _pool(self):
         utf8 = bool(self.flags & UTF8_FLAG)
@@ -155,9 +257,17 @@ class Manifest:
 # starts activities with MAIN + LAUNCHER; Echo's has MAIN + INFO) and the OpenXR
 # permissions the Khronos loader's runtime broker can require. All harmless on Quest.
 OPENXR_PERMISSIONS = ("org.khronos.openxr.permission.OPENXR", "org.khronos.openxr.permission.OPENXR_SYSTEM")
+# Hand tracking as an option: Horizon OS then starts Echo with the Quest controllers put away
+# (hands), for Rift Touch controllers over Wi-Fi (cv1bridge).
+HAND_TRACKING_FEATURE = "oculus.software.handtracking"
+HAND_TRACKING_PERMISSION = "com.oculus.permission.HAND_TRACKING"
+# Pico (PICO OS): a VR app says so with this application meta-data, and its activity launches into
+# VR with this category; without them Pico's launcher starts it as a 2D window.
+PICO_APP_TYPE = ("pvr.app.type", "vr")
+PICO_VR_CATEGORY = "com.picovr.intent.category.VR"
 
 
-def patch_manifest(data, log=print):
+def patch_manifest(data, log=print, pico=False):
     m = Manifest(data)
     if m.replace_string("android.intent.category.INFO", "android.intent.category.LAUNCHER"):
         log("  manifest: Echo's activity is now a LAUNCHER entry (Lepton needs it)")
@@ -165,7 +275,16 @@ def patch_manifest(data, log=print):
         log("  manifest: already a LAUNCHER entry")
     else:
         raise AxmlError("couldn't find Echo's activity category to make it a LAUNCHER entry")
-    for p in OPENXR_PERMISSIONS:
+    for p in OPENXR_PERMISSIONS + (HAND_TRACKING_PERMISSION,):
         if m.add_uses_permission(p):
             log(f"  manifest: added uses-permission {p}")
+    if m.add_uses_feature(HAND_TRACKING_FEATURE):
+        log(f"  manifest: added uses-feature {HAND_TRACKING_FEATURE} (not required): Echo starts without the Quest controllers")
+    if pico:
+        # next to Echo's own application meta-data, and its activity's LAUNCHER category
+        if m.clone_element("meta-data", "com.oculus.application.colorspace",
+                           {"name": PICO_APP_TYPE[0], "value": PICO_APP_TYPE[1]}):
+            log(f"  manifest: added meta-data {PICO_APP_TYPE[0]}={PICO_APP_TYPE[1]} (Pico: a VR app)")
+        if m.clone_element("category", "android.intent.category.LAUNCHER", {"name": PICO_VR_CATEGORY}):
+            log(f"  manifest: added category {PICO_VR_CATEGORY} (Pico: launches into VR)")
     return m.to_bytes()

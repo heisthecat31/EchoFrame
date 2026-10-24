@@ -239,17 +239,19 @@ def frame_code(data, log=print, patches=None, lib="libr15.so"):
     return bytes(data)
 
 
-def changes(apk, runtime, log=print, data_dir=None, frame_fixes=False, standin_mic=False):
+def changes(apk, runtime, log=print, data_dir=None, frame_fixes=False, standin_mic=False, pico=False):
     """{entry name: new bytes}: every change EchoQuestXR makes to an Echo VR APK. data_dir:
     where Echo reads its game data instead of /sdcard/Android/media/<package>; frame_fixes:
     FRAME_CODE_PATCHES and FRAME_RUNTIME_FILES. The Steam Frame build does both (FRAME_DATA_DIR).
     standin_mic (testing the Frame's microphone path on a Quest): only the Platform SDK stand-in
-    and FRAME_PNSOVR_PATCHES, so voice goes through the stand-in's microphone."""
-    standin = frame_fixes or standin_mic
+    and FRAME_PNSOVR_PATCHES, so voice goes through the stand-in's microphone. pico: the Pico build:
+    the stand-in (PICO OS has no Meta services either) and Pico's VR launch entries in the manifest;
+    game data stays in /sdcard/Android/media/<package> as on a Quest."""
+    standin = frame_fixes or standin_mic or pico
     files = RUNTIME_FILES + (FRAME_RUNTIME_FILES if standin else ())
     out = {LIB + f: open(os.path.join(runtime, f), "rb").read() for f in files}
     with zipfile.ZipFile(apk) as z:
-        out["AndroidManifest.xml"] = axml.patch_manifest(z.read("AndroidManifest.xml"), log)
+        out["AndroidManifest.xml"] = axml.patch_manifest(z.read("AndroidManifest.xml"), log, pico=pico)
         if frame_fixes:
             out[LIB + "libr15.so"] = frame_code(z.read(LIB + "libr15.so"), log)
         if standin:
@@ -270,17 +272,19 @@ def changes(apk, runtime, log=print, data_dir=None, frame_fixes=False, standin_m
     return out
 
 
-def patch(apk, out, log=print, data_dir=None, frame=False, standin_mic=False):
+def patch(apk, out, log=print, data_dir=None, frame=False, standin_mic=False, pico=False):
     """frame: the Steam Frame build (game data in FRAME_DATA_DIR unless data_dir says otherwise,
     the Vulkan fixes, the Platform SDK stand-in). standin_mic: a Quest build with the Frame's
-    microphone path (the stand-in), for testing it on a Quest."""
+    microphone path (the stand-in), for testing it on a Quest. pico: the Pico build (see changes)."""
+    if frame and pico:
+        raise PatchError("A build is for the Steam Frame or for Pico, not both.")
     log(f"Reading {apk}")
     log(f"  {inspect(apk)}")
     runtime = find_runtime()
     log(f"Runtime: {runtime}")
     try:
         replace = changes(apk, runtime, log, data_dir or (FRAME_DATA_DIR if frame else None), frame_fixes=frame,
-                          standin_mic=standin_mic)
+                          standin_mic=standin_mic, pico=pico)
     except axml.AxmlError as e:
         raise PatchError(f"Couldn't update AndroidManifest.xml: {e}")
 
@@ -348,13 +352,16 @@ def main():
     ap.add_argument("--frame", action="store_true",
                     help=f"Steam Frame build: game data in {FRAME_DATA_DIR}, Vulkan fixes for its driver, "
                          "Platform SDK stand-in")
+    ap.add_argument("--pico", action="store_true",
+                    help="Pico build (PICO OS): Platform SDK stand-in, Pico's VR launch entries")
     ap.add_argument("--data-dir", help="game data folder to use instead (testing)")
     ap.add_argument("--standin-mic", action="store_true",
                     help="Quest build with the Steam Frame's microphone path (Platform SDK stand-in), for testing")
     a = ap.parse_args()
-    out = a.out or os.path.splitext(a.apk)[0] + ("_openxr_frame.apk" if a.frame else "_openxr.apk")
+    out = a.out or os.path.splitext(a.apk)[0] + ("_openxr_frame.apk" if a.frame else "_openxr_pico.apk" if a.pico
+                                                  else "_openxr.apk")
     try:
-        patch(a.apk, out, data_dir=a.data_dir, frame=a.frame, standin_mic=a.standin_mic)
+        patch(a.apk, out, data_dir=a.data_dir, frame=a.frame, standin_mic=a.standin_mic, pico=a.pico)
     except PatchError as e:
         sys.exit(f"error: {e}")
 
