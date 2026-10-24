@@ -40,7 +40,9 @@ SAFE_PATH = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./-]*$")
 # Steam Frame) answers "logcat: not found" otherwise
 SYS = "/system/bin/"
 LOG_TAGS =["EchoQuestXR:V", "OpenXR:I", "OpenXR-Loader:V", "openxr_loader:V", "AndroidRuntime:E",
-            "DEBUG:V", "libc:F", "*:S"]
+            "DEBUG:V", "libc:F",
+            # Pico's OpenXR runtime and compositor (PICO OS)
+            "APxrRuntime:W", "PxrCompositor:W", "*:S"]
 NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0   # CREATE_NO_WINDOW: no console flashes
 
 
@@ -303,7 +305,11 @@ def launch(adb, serial):
 LOG_SCRIPT = "; ".join([
     f"P=$(pidof {PACKAGE})",
     "if [ -n \"$P\" ]; then echo \"=== Echo VR (pid $P)\"; logcat -d -v time --pid=$P; "
-    "else echo '=== Echo VR is not running: the last 4000 lines of everything'; logcat -d -v time -t 4000; fi",
+    # not running: Echo's lines from the whole log first (a busy headset, a Pico, fills 4000 lines in
+    # seconds), then the end of everything
+    "else echo '=== Echo VR is not running: its lines (and crashes, and its process starting and dying) from the whole log'; "
+    "logcat -d -v time | grep -aE 'readyatdawn|EchoQuestXR|/RAD |/AndroidRuntime|/DEBUG |/libc |OpenXR|vrapi|VrApi' "
+    "| tail -4000; echo '=== the last 1500 lines of everything'; logcat -d -v time -t 1500; fi",
     "echo '=== crash log'", "logcat -d -v time -b crash",
     "echo '=== EchoQuestXR and OpenXR, all processes'", "logcat -d -v time " + " ".join(f"'{t}'" for t in LOG_TAGS),
     # if Echo hangs (no picture, "Deadlock detected!"): where each of its threads is, and

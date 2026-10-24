@@ -36,6 +36,7 @@
 #include <jni.h>
 #include <link.h>
 #include <signal.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/system_properties.h>
@@ -50,6 +51,8 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -64,6 +67,7 @@
 
 #include "vrapi_layouts.h"
 #include "cv1_protocol.h"
+#include "customization_guard.h"
 
 #define TAG "EchoQuestXR"
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -103,56 +107,7 @@ struct Hand {
     double lastTime = 0;
     vr::Vector3f lastLinear{}, lastAngular{}, linearAccel{}, angularAccel{};
     double peakSpeed = 0;   // m/s since the last log line
-    // the velocities of this frame's display-time answer, and when it was given
-    vr::Vector3f dispLinear{}, dispAngular{};
-    double dispAsked = -1;
-    double dispTime = 0;
 };
-
-// Controller tuning (off Meta's runtime, and for Rift Touch over Wi-Fi). Fixed.
-float Tuned(uint32_t scrambled) {
-    static volatile uint32_t key = 0x6d2b79f5u;
-    uint32_t bits = scrambled ^ key;
-    float f;
-    memcpy(&f, &bits, sizeof f);
-    return f;
-}
-
-struct Tuning {
-    float speed = Tuned(0x52eb79f5u), spin = Tuned(0x526b79f5u), leadMs = Tuned(0xac8b79f5u);
-    float touchSpeed = Tuned(0x52984ac6u), touchSpin = Tuned(0x52984ac6u);
-};
-Tuning g_throw;
-
-// Echo as shipped: the adjustments above stay off for a modified Echo.
-bool EchoIntact() {
-    struct Rule { unsigned char name[64]; uint32_t bits; };
-    static const Rule rules[] = {
-        { {0x05, 0x00, 0x14, 0x6b, 0x6a, 0x14, 0x08, 0x3b, 0x3e, 0x1f, 0x34, 0x3d, 0x33, 0x34, 0x3f, 0x6b, 0x6f, 0x31, 0x0e, 0x32, 0x28, 0x35, 0x2d, 0x16, 0x33, 0x34, 0x0c, 0x3f, 0x36, 0x17, 0x3b, 0x22, 0x1f, 0x5a}, 0x41400000u },
-        { {0x05, 0x00, 0x14, 0x6b, 0x6a, 0x14, 0x08, 0x3b, 0x3e, 0x1f, 0x34, 0x3d, 0x33, 0x34, 0x3f, 0x6b, 0x62, 0x31, 0x0e, 0x32, 0x28, 0x35, 0x2d, 0x0a, 0x36, 0x3b, 0x23, 0x3f, 0x28, 0x0c, 0x3f, 0x36, 0x17, 0x3b, 0x22, 0x1f, 0x5a}, 0x40966666u },
-        { {0x05, 0x00, 0x14, 0x6b, 0x6a, 0x14, 0x08, 0x3b, 0x3e, 0x1f, 0x34, 0x3d, 0x33, 0x34, 0x3f, 0x6b, 0x6f, 0x31, 0x0e, 0x32, 0x28, 0x35, 0x2d, 0x19, 0x15, 0x17, 0x0c, 0x3f, 0x36, 0x17, 0x3b, 0x22, 0x1f, 0x5a}, 0x40133333u },
-        { {0x05, 0x00, 0x14, 0x6b, 0x6a, 0x14, 0x08, 0x3b, 0x3e, 0x1f, 0x34, 0x3d, 0x33, 0x34, 0x3f, 0x6b, 0x6f, 0x31, 0x0e, 0x32, 0x28, 0x35, 0x2d, 0x09, 0x2a, 0x3f, 0x3f, 0x3e, 0x17, 0x2f, 0x36, 0x2e, 0x1f, 0x5a}, 0x3f800000u },
-        { {0x05, 0x00, 0x14, 0x6b, 0x6a, 0x14, 0x08, 0x3b, 0x3e, 0x1f, 0x34, 0x3d, 0x33, 0x34, 0x3f, 0x68, 0x6e, 0x31, 0x0e, 0x32, 0x28, 0x35, 0x2d, 0x0c, 0x3f, 0x36, 0x0e, 0x33, 0x37, 0x3f, 0x0d, 0x33, 0x34, 0x3e, 0x35, 0x2d, 0x0b, 0x2f, 0x3f, 0x29, 0x2e, 0x1f, 0x5a}, 0x3d1db22du },
-        { {0x05, 0x00, 0x14, 0x6b, 0x6a, 0x14, 0x08, 0x3b, 0x3e, 0x1f, 0x34, 0x3d, 0x33, 0x34, 0x3f, 0x68, 0x6d, 0x31, 0x0e, 0x32, 0x28, 0x35, 0x2d, 0x1b, 0x34, 0x3d, 0x0c, 0x3f, 0x36, 0x0e, 0x33, 0x37, 0x3f, 0x0d, 0x33, 0x34, 0x3e, 0x35, 0x2d, 0x0b, 0x2f, 0x3f, 0x29, 0x2e, 0x1f, 0x5a}, 0x3d1db22du },
-        { {0x05, 0x00, 0x14, 0x6b, 0x6a, 0x14, 0x08, 0x3b, 0x3e, 0x1f, 0x34, 0x3d, 0x33, 0x34, 0x3f, 0x69, 0x68, 0x31, 0x1e, 0x23, 0x34, 0x3b, 0x37, 0x33, 0x39, 0x0e, 0x32, 0x28, 0x35, 0x2d, 0x1d, 0x28, 0x33, 0x2a, 0x17, 0x2f, 0x36, 0x2e, 0x33, 0x2a, 0x36, 0x33, 0x3f, 0x28, 0x0b, 0x2f, 0x3f, 0x29, 0x2e, 0x1f, 0x5a}, 0x3fc00000u }
-    };
-    void* echo = dlopen("libr15.so", RTLD_NOW | RTLD_NOLOAD);
-    if (!echo) return true;
-    static volatile unsigned char key = 0x5a;
-    bool intact = true;
-    for (const Rule& r : rules) {
-        char name[64];
-        for (size_t i = 0; i < sizeof name; ++i) {
-            name[i] = (char)(r.name[i] ^ key);
-            if (!name[i]) break;
-        }
-        const void* at = dlsym(echo, name);
-        uint32_t bits;
-        if (at && (memcpy(&bits, at, sizeof bits), bits != r.bits)) intact = false;
-    }
-    dlclose(echo);
-    return intact;
-}
 
 struct State {
     JavaVM* vm = nullptr;
@@ -194,8 +149,6 @@ struct State {
     Hand hands[2];
     uint64_t syncedFrame = ~0ull;
     bool useAimPose = false;
-    bool frameVelocity = false;   // controller tuning (off Meta's runtime)
-    bool echoIntact = false;      // Echo's own constants: the tuning may apply
     bool flipY = true;   // VrApi images are bottom-up; debug.echoquestxr.flip=0 turns this off
     // How: by an upside-down fov in the layer (Meta's compositor shows that right; on Steam
     // Frame each eye saw a wrong picture and the world slid as the head turned), or by
@@ -231,6 +184,9 @@ struct State {
 
     // extensions
     bool hasTimespec = false, hasRefreshRate = false, hasFrameController = false;
+    bool hasPicoController = false;   // XR_BD_controller_interaction (Pico 4, Neo 3)
+    bool pico = false;                // on PICO OS (Pico's runtime)
+    bool meta = false;                // Meta's runtime (a Quest)
     bool hasFdm = true;   // VK_EXT_fragment_density_map is in the device list Echo got
     std::set<std::string> driverDeviceExts;   // what the driver offers, probed before Echo's instance
     bool probedDeviceExts = false;
@@ -247,7 +203,14 @@ struct State {
     bool hasHandTracking = false;
     PFN_xrCreateHandTrackerEXT createHandTracker = nullptr;
     PFN_xrLocateHandJointsEXT locateHandJoints = nullptr;
+    PFN_xrDestroyHandTrackerEXT destroyHandTracker = nullptr;
+    // made for a Rift Touch alignment and destroyed after it: an open tracker can keep the
+    // headset's hand tracking running (CPU) all game
     XrHandTrackerEXT handTracker[2] = { XR_NULL_HANDLE, XR_NULL_HANDLE };
+    // performance levels (XR_EXT_performance_settings): off Meta's runtime nothing else asks for
+    // the clocks Echo wants (its vrapi_SetClockLevels goes nowhere)
+    bool hasPerfSettings = false;
+    PFN_xrPerfSettingsSetPerformanceLevelEXT setPerformanceLevel = nullptr;
     std::vector<float> rates;
 } g;
 
@@ -432,6 +395,13 @@ void BeginSessionIfReady() {
     if (Ok(xrBeginSession(g.session, &bi), "xrBeginSession")) {
         g.running = true;
         LOG("session running");
+        // Off Meta's runtime (a Pico): Echo's clock requests go nowhere, and the runtime's
+        // default levels let Echo's busy moments drop frames. Ask for sustained high CPU and GPU.
+        if (g.setPerformanceLevel && !g.meta) {
+            XrResult c = g.setPerformanceLevel(g.session, XR_PERF_SETTINGS_DOMAIN_CPU_EXT, XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT);
+            XrResult gp = g.setPerformanceLevel(g.session, XR_PERF_SETTINGS_DOMAIN_GPU_EXT, XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT);
+            LOG("performance levels: CPU sustained high %d, GPU sustained high %d", (int)c, (int)gp);
+        }
     }
 }
 
@@ -654,6 +624,23 @@ void CreateInput() {
     bind(g.secondaryTouch, "input/b/touch", "input/b/touch");
     suggest("/interaction_profiles/valve/index_controller");
 
+    // Pico 4 and Neo 3 (XR_BD_controller_interaction): Touch's layout without the thumb rest;
+    // the Pico 4's menu button is on the left only, the Neo 3 has one on each hand
+    if (g.hasPicoController) {
+        for (const char* profile : { "/interaction_profiles/bytedance/pico4_controller",
+                                     "/interaction_profiles/bytedance/pico_neo3_controller" }) {
+            common();
+            bind(g.triggerTouch, "input/trigger/touch", "input/trigger/touch");
+            bind(g.stickTouch, "input/thumbstick/touch", "input/thumbstick/touch");
+            bind(g.primary, "input/x/click", "input/a/click");
+            bind(g.primaryTouch, "input/x/touch", "input/a/touch");
+            bind(g.secondary, "input/y/click", "input/b/click");
+            bind(g.secondaryTouch, "input/y/touch", "input/b/touch");
+            bind(g.menu, "input/menu/click", nullptr);
+            suggest(profile);
+        }
+    }
+
     // anything else: trigger, menu and the poses
     bind(g.trigger, "input/select/click", "input/select/click");
     bind(g.menu, "input/menu/click", nullptr);
@@ -698,13 +685,6 @@ bool CreateSession() {
     rs.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_STAGE;
     if (XR_FAILED(xrCreateReferenceSpace(g.session, &rs, &g.stage))) g.stage = XR_NULL_HANDLE;
     CreateInput();
-    if (g.createHandTracker)
-        for (int hand = 0; hand < 2; ++hand) {
-            XrHandTrackerCreateInfoEXT hi{XR_TYPE_HAND_TRACKER_CREATE_INFO_EXT};
-            hi.hand = hand ? XR_HAND_RIGHT_EXT : XR_HAND_LEFT_EXT;
-            hi.handJointSet = XR_HAND_JOINT_SET_DEFAULT_EXT;
-            if (XR_FAILED(g.createHandTracker(g.session, &hi, &g.handTracker[hand]))) g.handTracker[hand] = XR_NULL_HANDLE;
-        }
     LOG("session created (queue family %u, index %u)", g.queueFamily, g.queueIndex);
     Cv1Start();
     return true;
@@ -2006,10 +1986,6 @@ void HangWatch() {
     }
 }
 
-// whether the controller tuning applies (off Meta's runtime, with Echo's own constants)
-bool ThrowActive() {
-    return g.echoIntact && g.frameVelocity;
-}
 
 // ---------------------------------------------------------------------------
 // Rift CV1 Touch over Wi-Fi: a PC with the Rift's sensors reads the Touch controllers
@@ -2481,6 +2457,23 @@ void Cv1TakeResult() {
     Cv1Status("aligned: error %.1f cm, delay %+.0f ms", r.rms * 100, r.lag * 1000);
 }
 
+// Opens (on) or closes (off) a hand tracker for each hand; on: true if both are open.
+bool HandTrackers(bool on) {
+    for (int hand = 0; hand < 2; ++hand) {
+        XrHandTrackerEXT& t = g.handTracker[hand];
+        if (on && t == XR_NULL_HANDLE && g.createHandTracker) {
+            XrHandTrackerCreateInfoEXT hi{XR_TYPE_HAND_TRACKER_CREATE_INFO_EXT};
+            hi.hand = hand ? XR_HAND_RIGHT_EXT : XR_HAND_LEFT_EXT;
+            hi.handJointSet = XR_HAND_JOINT_SET_DEFAULT_EXT;
+            if (XR_FAILED(g.createHandTracker(g.session, &hi, &t))) t = XR_NULL_HANDLE;
+        } else if (!on && t != XR_NULL_HANDLE) {
+            if (g.destroyHandTracker) g.destroyHandTracker(t);
+            t = XR_NULL_HANDLE;
+        }
+    }
+    return !on || (g.handTracker[0] != XR_NULL_HANDLE && g.handTracker[1] != XR_NULL_HANDLE);
+}
+
 // a tracked hand's palm in STAGE now
 bool PalmNow(int hand, double now, XrPosef& palm) {
     if (!g.locateHandJoints || g.handTracker[hand] == XR_NULL_HANDLE || g.stage == XR_NULL_HANDLE || !g.running) return false;
@@ -2536,7 +2529,10 @@ void Cv1Tick() {
     }
     if (ask && g_cv1.askedUntil < 0 && !g_cv1.solving) {
         if (g.stage == XR_NULL_HANDLE) { Cv1Status("can't align: the Quest has no boundary set up"); return; }
-        if (!g.locateHandJoints) { Cv1Status("can't align: hand tracking isn't available (turn it on in the Quest's settings)"); return; }
+        if (!g.locateHandJoints || !HandTrackers(true)) {
+            Cv1Status("can't align: hand tracking isn't available (turn it on in the headset's settings)");
+            return;
+        }
         g_cv1.asked[0].clear();
         g_cv1.asked[1].clear();
         g_cv1.askedUntil = now + 5;
@@ -2554,6 +2550,7 @@ void Cv1Tick() {
     }
     if (now < g_cv1.askedUntil) return;
     g_cv1.askedUntil = -1;
+    HandTrackers(false);
     Cv1SolveInBackground(g_cv1.asked[0], g_cv1.asked[1]);
 }
 
@@ -2585,8 +2582,11 @@ static char g_flipOption[PROP_VALUE_MAX] = "";   // "", 0, fov or copy: decided 
 EXPORT int32_t vrapi_Initialize(const vr::InitParms* p) {
     if (g.instance) return vr::kSuccess;
     if (!p || !p->java.Vm) return -1;
+    LOG("EchoQuestXR starting (VrApi %d.%d.%d asked for)", p->MajorVersion, p->MinorVersion, p->PatchVersion);
     static bool watching = false;
     if (!watching) { watching = true; std::thread(HangWatch).detach(); }
+    LOG("customization guard: installing");
+    customization_guard::Install();   // before any player's cosmetics load (Echo has loaded libr15.so by now)
     g.useAimPose = true;   // aim matches VrApi's controller pose (tested on Quest 3)
     Option("flip", g_flipOption);
     g.flipY = strcmp(g_flipOption, "0") != 0;
@@ -2628,9 +2628,12 @@ EXPORT int32_t vrapi_Initialize(const vr::InitParms* p) {
     if ((g.hasTimespec = has(XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME))) exts.push_back(XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME);
     if ((g.hasRefreshRate = has(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME))) exts.push_back(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
     if ((g.hasFrameController = has("XR_VALVE_frame_controller_interaction"))) exts.push_back("XR_VALVE_frame_controller_interaction");
+    if ((g.hasPicoController = has(XR_BD_CONTROLLER_INTERACTION_EXTENSION_NAME))) exts.push_back(XR_BD_CONTROLLER_INTERACTION_EXTENSION_NAME);
     if ((g.hasHandTracking = has(XR_EXT_HAND_TRACKING_EXTENSION_NAME))) exts.push_back(XR_EXT_HAND_TRACKING_EXTENSION_NAME);
-    LOG("OpenXR extensions: timespec %d, refresh rate %d, Steam Frame controllers %d, hand tracking %d",
-        g.hasTimespec, g.hasRefreshRate, g.hasFrameController, g.hasHandTracking);
+    if ((g.hasPerfSettings = has(XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME))) exts.push_back(XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME);
+    LOG("OpenXR extensions: timespec %d, refresh rate %d, Steam Frame controllers %d, Pico controllers %d, hand tracking %d, "
+        "performance settings %d", g.hasTimespec, g.hasRefreshRate, g.hasFrameController, g.hasPicoController, g.hasHandTracking,
+        g.hasPerfSettings);
     if (!has(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME)) { LOGE("runtime has no XR_KHR_vulkan_enable"); return -1; }
 
     XrInstanceCreateInfoAndroidKHR android{XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR};
@@ -2659,9 +2662,11 @@ EXPORT int32_t vrapi_Initialize(const vr::InitParms* p) {
         GetProc("xrGetDisplayRefreshRateFB", &g.getRate);
         GetProc("xrRequestDisplayRefreshRateFB", &g.requestRate);
     }
+    if (g.hasPerfSettings) GetProc("xrPerfSettingsSetPerformanceLevelEXT", &g.setPerformanceLevel);
     if (g.hasHandTracking) {
         GetProc("xrCreateHandTrackerEXT", &g.createHandTracker);
         GetProc("xrLocateHandJointsEXT", &g.locateHandJoints);
+        GetProc("xrDestroyHandTrackerEXT", &g.destroyHandTracker);
     }
 
     XrInstanceProperties ip{XR_TYPE_INSTANCE_PROPERTIES};
@@ -2682,10 +2687,15 @@ EXPORT int32_t vrapi_Initialize(const vr::InitParms* p) {
     // elsewhere; debug.echoquestxr.semguard 0/1 overrides
     char guard[PROP_VALUE_MAX] = "";
     Option("semguard", guard);
-    bool meta = strstr(ip.runtimeName, "Oculus") || strstr(ip.runtimeName, "Meta");
-    g.echoIntact = EchoIntact();
-    g.frameVelocity = !meta;
-    g.semaphoreGuard = guard[0] ? guard[0] == '1' : !meta;
+    bool meta = g.meta = strstr(ip.runtimeName, "Oculus") || strstr(ip.runtimeName, "Meta");
+    // PICO OS: by its runtime's name, or the headset's maker
+    char maker[PROP_VALUE_MAX] = "";
+    __system_property_get("ro.product.manufacturer", maker);
+    g.pico = !meta && (strcasestr(ip.runtimeName, "pico") || strcasestr(ip.runtimeName, "bytedance") ||
+                       strcasestr(maker, "pico") || strcasestr(maker, "bytedance"));
+    if (g.pico) LOG("Pico headset (runtime '%s', maker '%s')", ip.runtimeName, maker);
+    // Qualcomm's own driver on a Quest or a Pico: no guard needed
+    g.semaphoreGuard = guard[0] ? guard[0] == '1' : !meta && !g.pico;
     LOG("semaphore guard: %s", g.semaphoreGuard ? "on" : "off");
     // How to flip: by fov on Meta's runtime (tested on Quest 3), by copy elsewhere. On Steam
     // Frame (asymmetric vertical fov) the upside-down fov left everything too high and the
@@ -2784,6 +2794,9 @@ EXPORT int32_t vrapi_SetDisplayRefreshRate(void*, float rate) {
             return vr::kSuccess;
         }
         if (!want.empty()) rate = (float)atof(want.c_str());
+        // Pico 4: Echo asks it for 90 Hz, which its GPU doesn't hold (46-79 frames a second, a
+        // stutter on every missed frame); 72, as on a Quest
+        else if (g.pico && rate > 72) rate = 72;
         XrResult r = g.requestRate(g.session, rate);
         LOG("refresh rate %.0f requested: %d (now %.0f; offered: %s)", rate, (int)r, RefreshRate(), rates.c_str());
     }
@@ -3328,36 +3341,9 @@ EXPORT int32_t vrapi_GetInputTrackingState(void*, uint32_t deviceID, double seco
         if (cv1.status & CV1_ORIENTATION_VALID) st |= vr::kOrientationValid;
         if (cv1.status & CV1_POSITION_VALID) st |= vr::kPositionValid;
         out->Status = st;
-        const float speed = g_throw.touchSpeed, spin = g_throw.touchSpin;
-        p.LinearVelocity.x *= speed; p.LinearVelocity.y *= speed; p.LinearVelocity.z *= speed;
-        p.AngularVelocity.x *= spin; p.AngularVelocity.y *= spin; p.AngularVelocity.z *= spin;
         return vr::kSuccess;
     }
     if (Locate(g.useAimPose ? h.aim : h.grip, seconds, p, out->Status)) {
-        if (!latest) {
-            h.dispLinear = p.LinearVelocity;
-            h.dispAngular = p.AngularVelocity;
-            h.dispAsked = now;
-            h.dispTime = seconds;
-        } else if (ThrowActive()) {
-            if (now - h.dispAsked < 0.05) {
-                vr::RigidBodyPosef at;
-                uint32_t st = 0;
-                if (Locate(g.useAimPose ? h.aim : h.grip, h.dispTime + g_throw.leadMs / 1000.0, at, st)) {
-                    p.LinearVelocity = at.LinearVelocity;
-                    p.AngularVelocity = at.AngularVelocity;
-                } else {
-                    p.LinearVelocity = h.dispLinear;
-                    p.AngularVelocity = h.dispAngular;
-                }
-            }
-            p.LinearVelocity.x *= g_throw.speed;
-            p.LinearVelocity.y *= g_throw.speed;
-            p.LinearVelocity.z *= g_throw.speed;
-            p.AngularVelocity.x *= g_throw.spin;
-            p.AngularVelocity.y *= g_throw.spin;
-            p.AngularVelocity.z *= g_throw.spin;
-        }
         // Echo asks several times a frame for nearly the same time; update on a real step
         double dt = seconds - h.lastTime;
         if (dt > 0.004 && dt < 0.1) {

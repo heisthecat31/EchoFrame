@@ -1,5 +1,5 @@
 """EchoFrame (the EchoQuestXR patcher) window: a step-by-step guide from your Echo VR Quest APK to Echo running
-on OpenXR, on a Meta Quest or a Steam Frame.
+on OpenXR, on a Meta Quest, a Steam Frame or a Pico.
 
     pythonw gui.pyw      (double-click on Windows)
 
@@ -30,7 +30,7 @@ ACCENT, ACCENT2, GOOD, WARN, BAD = "#5b8cff", "#9a6bff", "#3ddc97", "#ffb547", "
 W, H = 1000, 710
 SIDE_W = 250
 CX, CW = 290, 670            # the page's content column
-TAGS = ("quest", "frame", "pick", "out", "go", "use", "skip", "folder", "details", "data", "connect", "getadb", "install",
+TAGS = ("quest", "frame", "pico", "pick", "out", "go", "use", "skip", "folder", "details", "data", "connect", "getadb", "install",
         "cv1", "cv1align", "cv1rumble",
         "launch", "logs", "back", "next", "advanced", "run", "q0", "q1", "q2", "q3", "q4", "step0", "step1", "step2", "step3", "step4", "step5", "step6")
 
@@ -361,9 +361,10 @@ class App(tk.Tk):
                            "next steps show what to do on it.", "body", MUTED, width=CW)
         for i, (tag, name, lines) in enumerate((
                 ("quest", "Meta Quest", "Quest 2, Quest 3, Quest Pro.\nConnect with a USB cable."),
-                ("frame", "Steam Frame", "Runs in Lepton, the Frame's Android layer.\nConnect with a USB-C cable.")) ):
-            x = CX + i * (CW // 2 + 8)
-            w = CW // 2 - 8
+                ("frame", "Steam Frame", "Runs in Lepton, the Frame's Android layer.\nConnect with a USB-C cable."),
+                ("pico", "Pico", "Pico 4, 4 Ultra, Neo 3.\nConnect with a USB cable. (New: not tested yet.)")) ):
+            x = CX + i * (CW // 3 + 4)
+            w = CW // 3 - 8
             chosen = self.headset == tag
             hot = self.hot == tag
             self.rrect(x, 180, w, 190, 18, CARD_HI if (hot or chosen) else CARD,
@@ -378,6 +379,9 @@ class App(tk.Tk):
         if self.headset == "frame":
             self.text(CX, 396, "You'll need Developer Mode on the Frame and a USB-C cable. The patcher sets the rest "
                                "up itself.", "small", FAINT, width=CW)
+        elif self.headset == "pico":
+            self.text(CX, 396, "Pico support is new and hasn't been tried on a Pico yet. If something doesn't work, "
+                               "press Save logs on the last step and send the file.", "small", WARN, width=CW)
 
     def page_apk(self):
         self.text(CX, 108, "Choose your own copy of the Echo VR Quest APK (your personalised one). The patcher reads it "
@@ -404,7 +408,9 @@ class App(tk.Tk):
         self.text(CX, 108, "This makes the version of Echo that runs on OpenXR" +
                   (" on the Steam Frame: it also points Echo at a folder the Frame keeps, fixes Echo's Vulkan set-up for "
                    "the Frame's graphics driver, and stands in for Meta's Platform SDK." if frame else
-                   ", the open VR standard your Quest supports.") + " It takes about a minute.",
+                   (", the open VR standard your Pico supports, and stands in for Meta's Platform SDK (a Pico has no "
+                    "Meta services)." if self.headset == "pico" else ", the open VR standard your Quest supports.")) +
+                  " It takes about a minute.",
                   "body", MUTED, width=CW)
         y = 210
         self.rrect(CX, y, CW, 70, 14, CARD, outline=BORDER)
@@ -463,10 +469,14 @@ class App(tk.Tk):
             self.button(CX + CW - 150, y, 150, 40, "Connect", "connect", primary=not ok, enabled=not self.dev_busy and bool(self.adb))
             y += 62
         else:
-            self.text(CX, 108, "Connect the Quest to this PC with a USB cable:", "body", MUTED, width=CW)
+            pico = self.headset == "pico"
+            self.text(CX, 108, f"Connect the {'Pico' if pico else 'Quest'} to this PC with a USB cable:", "body", MUTED,
+                      width=CW)
             y = self.bullets(CX, 146, [
+                "Turn on Developer Mode on the Pico (Settings > General > About: tap Software Version 7 times; then "
+                "Settings > Developer: USB debugging on)." if pico else
                 "Turn on Developer Mode for the Quest (in the Meta Horizon app on your phone).",
-                "Plug the Quest into this PC with a USB cable.",
+                f"Plug the {'Pico' if pico else 'Quest'} into this PC with a USB cable.",
                 "Put the headset on and choose Allow on the \"Allow USB debugging?\" prompt "
                 "(tick \"Always allow from this computer\").",
             ])
@@ -866,10 +876,10 @@ class App(tk.Tk):
             return
         steps = self.steps()
         working = self.state == "working"
-        if t in ("quest", "frame") and not working:
+        if t in ("quest", "frame", "pico") and not working:
             self.headset = t
             _write("headset", t)
-            self.set_frame(t == "frame")
+            self.set_target(t)
             self.step = 1
         elif t == "advanced":
             self.advanced = not self.advanced
@@ -947,10 +957,17 @@ class App(tk.Tk):
 
     def set_frame(self, on):
         """The Steam Frame build or the Quest one, renaming the output to match."""
+        self.set_target("frame" if on else "quest")
+
+    def set_target(self, headset):
+        """The build for this headset (quest, frame or pico): renames the output to match."""
         if self.out and self.state != "done":
             stem, ext = os.path.splitext(self.out)
-            stem = stem[:-len("_frame")] if stem.endswith("_openxr_frame") else stem
-            self.out = stem + ("_frame" if on and stem.endswith("_openxr") else "") + ext
+            for kind in ("_frame", "_pico"):
+                if stem.endswith("_openxr" + kind):
+                    stem = stem[:-len(kind)]
+            suffix = {"frame": "_frame", "pico": "_pico"}.get(headset, "")
+            self.out = stem + (suffix if stem.endswith("_openxr") else "") + ext
 
     def headset_click(self, t):
         if not self.adb:   # every headset action needs adb (it installs itself at startup)
@@ -991,7 +1008,8 @@ class App(tk.Tk):
             return
         self.apk = path
         self.skip_apk = False
-        self.out = os.path.splitext(path)[0] + ("_openxr_frame.apk" if self.headset == "frame" else "_openxr.apk")
+        self.out = os.path.splitext(path)[0] + {"frame": "_openxr_frame.apk", "pico": "_openxr_pico.apk"}.get(
+            self.headset, "_openxr.apk")
         self.state, self.lines, self.result = "ready", [], None
         try:
             self.verdict = patch.inspect(path)
@@ -1003,9 +1021,10 @@ class App(tk.Tk):
     def start(self):
         self.state, self.message, self.progress, self.lines = "working", "Reading the APK...", 0.05, []
         self.draw()
-        threading.Thread(target=self.work, args=(self.apk, self.out, self.headset == "frame"), daemon=True).start()
+        threading.Thread(target=self.work, args=(self.apk, self.out, self.headset == "frame", self.headset == "pico"),
+                         daemon=True).start()
 
-    def work(self, apk, out, for_frame=False):
+    def work(self, apk, out, for_frame=False, for_pico=False):
         steps = {"Runtime": .2, "  added": .4, "  replaced": .5, "Generating": .6, "Reusing": .6, "Wrote": .95}
         def log(m):
             for k, v in steps.items():
@@ -1015,7 +1034,7 @@ class App(tk.Tk):
             if m.startswith(("Generating", "Reusing")):
                 self.msgs.put(("message", "Signing..."))
         try:
-            result = patch.patch(apk, out, log=log, frame=for_frame)
+            result = patch.patch(apk, out, log=log, frame=for_frame, pico=for_pico)
             self.msgs.put(("built_for_frame", for_frame))
             self.msgs.put(("done", result))
         except patch.PatchError as e:

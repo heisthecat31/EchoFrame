@@ -5,6 +5,7 @@ stream of element records that refer to strings by index. Supported edits:
   replace_string(old, new)      change a string's text everywhere it's used
   add_uses_permission(name)     add <uses-permission android:name="..."/> after the last one
   add_uses_feature(name)        add <uses-feature android:name="..." android:required="false"/>
+  clone_element(tag, name, values)  copy an element that has no children, changing string attributes
 Strings are only appended to the pool, so every existing index stays valid.
 """
 import struct
@@ -174,6 +175,56 @@ class Manifest:
             return True
         raise AxmlError("the manifest has no named <uses-feature> to copy")
 
+    def _attrs(self, o):
+        """[(attribute name, string value or None)] of the start element at offset o."""
+        out = []
+        for a in range(struct.unpack_from("<H", self.rest, o + 28)[0]):
+            an, raw = struct.unpack_from("<II", self.rest, o + 36 + 20 * a + 4)
+            out.append((self.strings[an], self.strings[raw] if raw != 0xFFFFFFFF else None))
+        return out
+
+    def has_element(self, tag, **values):
+        """Whether an element <tag> has every attribute given (name=value, all strings)."""
+        for o, t, size in self._chunks():
+            if t == RES_START_ELEMENT and self.strings[struct.unpack_from("<I", self.rest, o + 20)[0]] == tag:
+                attrs = dict(self._attrs(o))
+                if all(attrs.get(k) == v for k, v in values.items()):
+                    return True
+        return False
+
+    def clone_element(self, tag, name, values):
+        """Copies the first <tag android:name=name> (an element without children: its start and
+        end records) and puts the copy right after it, with the string attributes in values
+        (attribute name -> new text) changed. Returns False if an element with those values is
+        there already."""
+        if self.has_element(tag, **values):
+            return False
+        chunks = self._chunks()
+        for k, (o, t, size) in enumerate(chunks):
+            if t != RES_START_ELEMENT or self.strings[struct.unpack_from("<I", self.rest, o + 20)[0]] != tag:
+                continue
+            if dict(self._attrs(o)).get("name") != name:
+                continue
+            end = chunks[k + 1]
+            if end[1] != RES_END_ELEMENT:
+                raise AxmlError(f"a <{tag}> with children isn't supported")
+            start = bytearray(self.rest[o:o + size])
+            for a in range(struct.unpack_from("<H", start, 28)[0]):
+                at = 36 + 20 * a
+                an, raw = struct.unpack_from("<II", start, at + 4)
+                key = self.strings[an]
+                if key in values:
+                    if raw == 0xFFFFFFFF:
+                        raise AxmlError(f"<{tag}> {key} isn't a string")
+                    idx = self.add_string(values[key])
+                    struct.pack_into("<I", start, at + 8, idx)        # raw value
+                    struct.pack_into("<I", start, at + 16, idx)       # typed value (a string index)
+            eo, esize = end[0], end[2]
+            here = eo + esize
+            self.rest = self.rest[:here] + bytes(start) + self.rest[eo:eo + esize] + self.rest[here:]
+            return True
+        raise AxmlError(f"the manifest has no <{tag} android:name=\"{name}\"> to copy")
+
     # ------------------------------------------------------------------ writing
     def _pool(self):
         utf8 = bool(self.flags & UTF8_FLAG)
@@ -210,9 +261,13 @@ OPENXR_PERMISSIONS = ("org.khronos.openxr.permission.OPENXR", "org.khronos.openx
 # (hands), for Rift Touch controllers over Wi-Fi (cv1bridge).
 HAND_TRACKING_FEATURE = "oculus.software.handtracking"
 HAND_TRACKING_PERMISSION = "com.oculus.permission.HAND_TRACKING"
+# Pico (PICO OS): a VR app says so with this application meta-data, and its activity launches into
+# VR with this category; without them Pico's launcher starts it as a 2D window.
+PICO_APP_TYPE = ("pvr.app.type", "vr")
+PICO_VR_CATEGORY = "com.picovr.intent.category.VR"
 
 
-def patch_manifest(data, log=print):
+def patch_manifest(data, log=print, pico=False):
     m = Manifest(data)
     if m.replace_string("android.intent.category.INFO", "android.intent.category.LAUNCHER"):
         log("  manifest: Echo's activity is now a LAUNCHER entry (Lepton needs it)")
@@ -225,4 +280,11 @@ def patch_manifest(data, log=print):
             log(f"  manifest: added uses-permission {p}")
     if m.add_uses_feature(HAND_TRACKING_FEATURE):
         log(f"  manifest: added uses-feature {HAND_TRACKING_FEATURE} (not required): Echo starts without the Quest controllers")
+    if pico:
+        # next to Echo's own application meta-data, and its activity's LAUNCHER category
+        if m.clone_element("meta-data", "com.oculus.application.colorspace",
+                           {"name": PICO_APP_TYPE[0], "value": PICO_APP_TYPE[1]}):
+            log(f"  manifest: added meta-data {PICO_APP_TYPE[0]}={PICO_APP_TYPE[1]} (Pico: a VR app)")
+        if m.clone_element("category", "android.intent.category.LAUNCHER", {"name": PICO_VR_CATEGORY}):
+            log(f"  manifest: added category {PICO_VR_CATEGORY} (Pico: launches into VR)")
     return m.to_bytes()

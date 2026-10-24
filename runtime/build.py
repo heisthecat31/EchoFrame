@@ -121,6 +121,22 @@ def build_platform_standin():
     return lib
 
 
+def build_custguard():
+    """build/libcustgd.so: the customization guard on its own (custguard.cpp), for an Echo build
+    whose libvrapi.so is someone else's; tools/add_custguard.py puts it in such an APK."""
+    os.makedirs(BUILD, exist_ok=True)
+    bin_ = apkpack.ndk_bin()
+    lib = os.path.join(BUILD, "libcustgd.so")
+    apkpack.run([os.path.join(bin_, "clang++.exe"), f"--target=aarch64-linux-android{apkpack.API}", "-fPIC", "-O2",
+                 "-Wall", "-Wextra", "-fvisibility=hidden", "-std=c++17", "-shared", "-static-libstdc++",
+                 os.path.join(HERE, "custguard.cpp"),
+                 "-Wl,-soname,libcustgd.so", "-Wl,--no-undefined", "-Wl,-z,max-page-size=16384",
+                 "-Wl,--exclude-libs,ALL", "-llog", "-ldl", "-o", lib])
+    apkpack.run([os.path.join(bin_, "llvm-strip.exe"), "--strip-unneeded", lib])
+    print(f"built {lib} ({os.path.getsize(lib) // 1024} KB)")
+    return lib
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--apk")
@@ -137,6 +153,7 @@ def main():
     loader = build_loader()
     lib = build_lib(loader)
     build_platform_standin()
+    build_custguard()
     if a.lib_only:
         return
     if not a.apk or not a.ks:

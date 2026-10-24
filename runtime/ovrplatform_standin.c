@@ -38,6 +38,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/system_properties.h>
 
 #define TAG "EchoQuestXR"
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -306,7 +307,19 @@ typedef struct {
 // above -6 dBFS so shouting rounds off instead of clipping (the earlier -6 dB was for a
 // microphone that reached 0 dBFS, which an automatic gain had made worse). The input level, and
 // what Echo is sent, are logged every 5 s.
-#define MIC_SCALE 2.0f
+// The Pico 4's microphone peaks at about -5 dBFS, louder than the Quest's: +6 dB pinned what
+// Echo got at the limiter, so on a Pico there's no boost (MicScale).
+static float MicScale(void) {
+    static float scale = 0;
+    if (!scale) {
+        char maker[PROP_VALUE_MAX] = "";
+        __system_property_get("ro.product.manufacturer", maker);
+        scale = (strcasestr(maker, "pico") || strcasestr(maker, "bytedance")) ? 1.0f : 2.0f;
+        LOG("Platform SDK: microphone gain %+.0f dB (%s)", scale > 1 ? 6.0 : 0.0, maker);
+    }
+    return scale;
+}
+#define MIC_SCALE MicScale()
 #define MIC_KNEE 16384.0f   // -6 dBFS: above it, tanh towards full scale
 static float SoftLimit(float y) {
     float a = fabsf(y);
