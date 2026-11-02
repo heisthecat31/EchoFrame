@@ -57,6 +57,7 @@
 #include <deque>
 #include <map>
 #include <mutex>
+#include <shared_mutex>
 #include <set>
 #include <sstream>
 #include <string>
@@ -1796,10 +1797,9 @@ int FindLibr15(dl_phdr_info* info, size_t, void* data) {
 // Replaces, in libr15.so's writable data (not its RELRO, which is read-only), every pointer
 // to one of the hooked functions: Echo loads libvulkan itself and keeps the addresses it
 // gets in tables. Can run again: what's replaced isn't found a second time.
-int InstallVulkanHooks(const char* when, bool quiet = false) {
+int InstallHooks(std::vector<VulkanHook>& hooks, const char* when, bool quiet) {
     static std::mutex installLock;
     std::lock_guard<std::mutex> installing(installLock);
-    std::vector<VulkanHook>& hooks = VulkanHooks();
     void* libvulkan = dlopen("libvulkan.so", RTLD_NOW | RTLD_NOLOAD);
     for (VulkanHook& h : hooks) {
         if (libvulkan) if (void* p = dlsym(libvulkan, h.name)) h.originals.insert((uintptr_t)p);
@@ -1838,6 +1838,152 @@ int InstallVulkanHooks(const char* when, bool quiet = false) {
     }
     if (!quiet || found) LOG("Vulkan hooks (%s): %d entr%s replaced, new:%s", when, found, found == 1 ? "y" : "ies", names.c_str());
     return found;
+}
+
+int InstallVulkanHooks(const char* when, bool quiet = false) { return InstallHooks(VulkanHooks(), when, quiet); }
+
+// ---------------------------------------------------------------------------
+// pipeline cache (Pico): Echo creates a Vulkan pipeline the first time a model or material
+// shows (a player's cosmetics as they join), and the driver compiles its shaders then, on
+// Echo's main loop: on a Pico that stopped Echo for half a second or more each time, every
+// session (Meta's driver keeps them; Pico's didn't). Echo's pipelines go through a cache kept in
+// Echo's files folder, so anything compiled once comes back in milliseconds afterwards. The
+// driver checks the data's header and ignores data that isn't its own. Logged: how many
+// pipelines, the time they took and the longest.
+// ---------------------------------------------------------------------------
+const char* kPipelineCacheFile = "/data/data/com.readyatdawn.r15/files/echoquestxr-pipelines.bin";
+PFN_vkCreateGraphicsPipelines g_realCreateGraphicsPipelines;
+PFN_vkCreateComputePipelines g_realCreateComputePipelines;
+std::shared_mutex g_cacheLock;   // shared: pipelines being made; exclusive: the cache being read out
+VkPipelineCache g_cache = VK_NULL_HANDLE;
+VkDevice g_cacheDevice = VK_NULL_HANDLE;
+std::atomic<int> g_cacheNew{0};           // pipelines made since the last save
+std::atomic<int> g_pipelines{0}, g_pipelinesCached{0};
+std::atomic<double> g_pipelineMs{0}, g_pipelineLongest{0};
+std::mutex g_cacheMake;
+
+VkPipelineCache PipelineCache(VkDevice device) {
+    std::lock_guard<std::mutex> l(g_cacheMake);
+    if (g_cache != VK_NULL_HANDLE || device == VK_NULL_HANDLE) return g_cache;
+    std::vector<char> data;
+    if (FILE* f = fopen(kPipelineCacheFile, "rbe")) {
+        fseek(f, 0, SEEK_END);
+        long n = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (n > 0 && n < (256 << 20)) {
+            data.resize((size_t)n);
+            if (fread(data.data(), 1, data.size(), f) != data.size()) data.clear();
+        }
+        fclose(f);
+    }
+    VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    ci.initialDataSize = data.size();
+    ci.pInitialData = data.empty() ? nullptr : data.data();
+    auto create = reinterpret_cast<PFN_vkCreatePipelineCache>(vkGetDeviceProcAddr(device, "vkCreatePipelineCache"));
+    VkResult r = create ? create(device, &ci, nullptr, &g_cache) : VK_ERROR_INITIALIZATION_FAILED;
+    if (r != VK_SUCCESS && !data.empty()) {   // not this driver's data: start empty
+        ci.initialDataSize = 0;
+        ci.pInitialData = nullptr;
+        r = create(device, &ci, nullptr, &g_cache);
+    }
+    if (r != VK_SUCCESS) g_cache = VK_NULL_HANDLE;
+    else g_cacheDevice = device;
+    LOG("pipeline cache: %s (%zu KB from %s)", r == VK_SUCCESS ? "ready" : "couldn't be made", data.size() / 1024,
+        data.empty() ? "nothing saved yet" : "the last session");
+    return g_cache;
+}
+
+void SavePipelineCache(const char* why) {
+    if (g_cache == VK_NULL_HANDLE || g_cacheNew.load() == 0) return;
+    auto get = reinterpret_cast<PFN_vkGetPipelineCacheData>(vkGetDeviceProcAddr(g_cacheDevice, "vkGetPipelineCacheData"));
+    if (!get) return;
+    std::vector<char> data;
+    {
+        std::unique_lock<std::shared_mutex> l(g_cacheLock);
+        size_t n = 0;
+        if (get(g_cacheDevice, g_cache, &n, nullptr) != VK_SUCCESS || !n) return;
+        data.resize(n);
+        if (get(g_cacheDevice, g_cache, &n, data.data()) != VK_SUCCESS) return;
+        data.resize(n);
+        g_cacheNew = 0;
+    }
+    std::string tmp = std::string(kPipelineCacheFile) + ".part";
+    FILE* f = fopen(tmp.c_str(), "wbe");
+    if (!f) return;
+    bool ok = fwrite(data.data(), 1, data.size(), f) == data.size();
+    ok = fclose(f) == 0 && ok;
+    if (ok && rename(tmp.c_str(), kPipelineCacheFile) == 0)
+        LOG("pipeline cache: saved %zu KB (%s)", data.size() / 1024, why);
+}
+
+void NotePipelines(uint32_t count, double ms, bool cached) {
+    g_pipelines += (int)count;
+    if (cached) g_pipelinesCached += (int)count;
+    g_cacheNew += (int)count;
+    double total = g_pipelineMs.load();
+    while (!g_pipelineMs.compare_exchange_weak(total, total + ms)) {}
+    double longest = g_pipelineLongest.load();
+    while (ms > longest && !g_pipelineLongest.compare_exchange_weak(longest, ms)) {}
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL CacheCreateGraphicsPipelines(VkDevice device, VkPipelineCache cache, uint32_t count,
+                                                            const VkGraphicsPipelineCreateInfo* infos,
+                                                            const VkAllocationCallbacks* alloc, VkPipeline* out) {
+    bool ours = cache == VK_NULL_HANDLE && PipelineCache(device) != VK_NULL_HANDLE;
+    double t0 = Now();
+    VkResult r;
+    {
+        std::shared_lock<std::shared_mutex> l(g_cacheLock);
+        r = g_realCreateGraphicsPipelines(device, ours ? g_cache : cache, count, infos, alloc, out);
+    }
+    NotePipelines(count, (Now() - t0) * 1000, ours);
+    return r;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL CacheCreateComputePipelines(VkDevice device, VkPipelineCache cache, uint32_t count,
+                                                           const VkComputePipelineCreateInfo* infos,
+                                                           const VkAllocationCallbacks* alloc, VkPipeline* out) {
+    bool ours = cache == VK_NULL_HANDLE && PipelineCache(device) != VK_NULL_HANDLE;
+    double t0 = Now();
+    VkResult r;
+    {
+        std::shared_lock<std::shared_mutex> l(g_cacheLock);
+        r = g_realCreateComputePipelines(device, ours ? g_cache : cache, count, infos, alloc, out);
+    }
+    NotePipelines(count, (Now() - t0) * 1000, ours);
+    return r;
+}
+
+std::vector<VulkanHook>& PipelineHooks() {
+    static std::vector<VulkanHook> hooks = {
+        { "vkCreateGraphicsPipelines", (void*)CacheCreateGraphicsPipelines, (void**)&g_realCreateGraphicsPipelines, {}, 0 },
+        { "vkCreateComputePipelines", (void*)CacheCreateComputePipelines, (void**)&g_realCreateComputePipelines, {}, 0 },
+    };
+    return hooks;
+}
+
+// Saves the cache every 30 s while new pipelines appear, and logs what pipeline creation cost.
+void PipelineCacheThread() {
+    for (;;) {
+        sleep(30);
+        int n = g_pipelines.exchange(0), cached = g_pipelinesCached.exchange(0);
+        double ms = g_pipelineMs.exchange(0), longest = g_pipelineLongest.exchange(0);
+        if (n) LOG("pipelines: %d made in the last 30 s (%d through the cache), %.0f ms in all, longest %.0f ms", n, cached, ms,
+                   longest);
+        SavePipelineCache("every 30 s");
+    }
+}
+
+bool g_pipelineCacheOn = false;
+
+void StartPipelineCache(const char* when) {
+    if (!g_pipelineCacheOn) return;
+    int n = InstallHooks(PipelineHooks(), when, true);
+    static bool started = false;
+    if (n && !started) {
+        started = true;
+        std::thread(PipelineCacheThread).detach();
+    }
 }
 
 std::atomic<bool> g_firstFrame{false};
@@ -2863,6 +3009,9 @@ EXPORT int32_t vrapi_CreateSystemVulkan(vr::SystemCreateInfoVulkan* info) {
     vkGetPhysicalDeviceQueueFamilyProperties(g.vkPhysical, &n, fam.data());
     for (uint32_t i = 0; i < n; ++i)
         if (fam[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) { g.queueFamily = i; break; }
+    // Pico: Echo's pipelines through a cache kept between sessions (shader compiles froze it)
+    g_pipelineCacheOn = g.pico;
+    StartPipelineCache("pipeline cache, system created");
     if (g.semaphoreGuard) {
         WatchVulkanMessages();
         InstallVulkanHooks("system created");
@@ -2991,6 +3140,7 @@ EXPORT void* vrapi_EnterVrMode(const vr::ModeParmsVulkan* p) {
 }
 
 EXPORT void vrapi_LeaveVrMode(void*) {
+    if (g_pipelineCacheOn) std::thread(SavePipelineCache, "Echo paused").detach();
     // The runtime stops the session itself when Echo is paused (STOPPING -> xrEndSession);
     // keeping it lets EnterVrMode resume with the same swapchains.
     g.wantRunning = false;
@@ -3002,6 +3152,7 @@ EXPORT int32_t vrapi_PollEvent(vr::EventHeader* event) {
     if (!guardChecked) {
         guardChecked = true;
         if (g.semaphoreGuard) InstallVulkanHooks("first frame");
+        StartPipelineCache("pipeline cache, first frame");
         g_firstFrame.store(true);
     }
     g_echoTid.store((pid_t)syscall(SYS_gettid));
