@@ -1,6 +1,6 @@
 """EchoQuestXR patcher: turns your Echo VR Quest APK into one that runs on OpenXR.
 
-    python patch.py <echo.apk> [-o <out.apk>] [--frame | --standin-mic]   (or use gui.pyw)
+    python patch.py [<echo.apk>] [-o <out.apk>] [--frame | --pico | --standin-mic]   (or use gui.pyw)
 
 The changes (changes() below; runtime/build.py makes the same ones):
   lib/arm64-v8a/libvrapi.so         replaced by the EchoQuestXR runtime (VrApi on OpenXR)
@@ -11,11 +11,16 @@ The changes (changes() below; runtime/build.py makes the same ones):
   libr15.so, libassetpatch.so       Steam Frame build only (--frame): the game data path
                                     becomes Echo's private folder (relocate()), and
                                     the Vulkan fixes for its driver (frame_code())
-  libovrplatformloader.so           Steam Frame build only: replaced by EchoQuestXR's
+  libovrplatformloader.so           Steam Frame and Pico builds: replaced by EchoQuestXR's
                                     stand-in for Meta's Platform SDK, which isn't on the
                                     Frame (Meta's loader aborts Echo when it finds no
-                                    Platform SDK service)
+                                    Platform SDK service). In nevr-runtime's APK that file is
+                                    the nevr runtime: it stays, and the stand-in replaces
+                                    Meta's loader under it (libovrplatformloader_orig.so)
 Everything else in the APK is copied unchanged.
+
+With no APK given, the newest Echo VR Quest APK is downloaded from nevr-runtime's releases
+(device.download_quest_apk: evr.echo.taxi/nevr-runtime/manifest.json, sha256-checked).
 
 The result is signed with your own random key (RSA-2048, self-signed), made the first time
 and saved next to the APK as <name>.signing-key.pem (keep it private), so no two people share
@@ -51,6 +56,10 @@ RUNTIME_FILES = ("libvrapi.so", "libopenxr_loader.so")
 # Horizon OS's Platform SDK service; without it, it throws and Echo aborts as it starts its
 # OVR provider ("Failed to launch SystemActivities").
 FRAME_RUNTIME_FILES = ("libovrplatformloader.so",)
+# nevr-runtime's APK (what the patcher downloads): its libovrplatformloader.so is the nevr
+# runtime, which needs Meta's loader under this name (DT_NEEDED) and finds ovr_* there. Its
+# builds keep the nevr runtime and put the stand-in here instead.
+NEVR_PLATFORM_ORIG = "libovrplatformloader_orig.so"
 # Meta's VrApi loader 1.1.40 as shipped in Echo VR build 4987566
 META_VRAPI_SHA256 = "43bec081aae29781389823f690b5f63932905f76cb96452474a65ef8c16fd3e6"
 SIGNATURE_FILES = (".SF", ".RSA", ".DSA", ".EC")
@@ -60,7 +69,7 @@ SIGNATURE_FILES = (".SF", ".RSA", ".DSA", ".EC")
 # Frame: ~/.local/share/Steam/steamapps/compatdata/<instance>/internal/<package>).
 MEDIA_DIR = "/sdcard/Android/media/com.readyatdawn.r15"
 FRAME_DATA_DIR = "/data/data/com.readyatdawn.r15"
-DATA_DIR_LIBS = ("libr15.so", "libassetpatch.so")
+DATA_DIR_LIBS = ("libr15.so", "libassetpatch.so", "libovrplatformloader.so")   # the last: nevr-runtime's
 # Code changes in Echo's CGS::Initialize (libr15.so, build 4987566) for the Frame's Mesa
 # driver: (what, bytes to find (exactly once), offset in them, replacement).
 FRAME_CODE_PATCHES = [
@@ -248,21 +257,29 @@ def changes(apk, runtime, log=print, data_dir=None, frame_fixes=False, standin_m
     the stand-in (PICO OS has no Meta services either) and Pico's VR launch entries in the manifest;
     game data stays in /sdcard/Android/media/<package> as on a Quest."""
     standin = frame_fixes or standin_mic or pico
-    files = RUNTIME_FILES + (FRAME_RUNTIME_FILES if standin else ())
-    out = {LIB + f: open(os.path.join(runtime, f), "rb").read() for f in files}
+    out = {LIB + f: open(os.path.join(runtime, f), "rb").read() for f in RUNTIME_FILES}
     with zipfile.ZipFile(apk) as z:
+        names = set(z.namelist())
         out["AndroidManifest.xml"] = axml.patch_manifest(z.read("AndroidManifest.xml"), log, pico=pico)
         if frame_fixes:
             out[LIB + "libr15.so"] = frame_code(z.read(LIB + "libr15.so"), log)
         if standin:
-            if LIB + "libpnsovr.so" in z.namelist():
+            for f in FRAME_RUNTIME_FILES:
+                nevr = f == "libovrplatformloader.so" and LIB + NEVR_PLATFORM_ORIG in names
+                out[LIB + (NEVR_PLATFORM_ORIG if nevr else f)] = open(os.path.join(runtime, f), "rb").read()
+            if LIB + "libpnsovr.so" in names:
                 out[LIB + "libpnsovr.so"] = frame_code(z.read(LIB + "libpnsovr.so"), log, FRAME_PNSOVR_PATCHES,
                                                        "libpnsovr.so")
-            log("  libovrplatformloader.so: EchoQuestXR's Platform SDK stand-in (Meta's needs Horizon OS)")
+            if LIB + NEVR_PLATFORM_ORIG in names:
+                log(f"  {NEVR_PLATFORM_ORIG}: EchoQuestXR's Platform SDK stand-in under the nevr runtime "
+                    "(Meta's needs Horizon OS)")
+            else:
+                log("  libovrplatformloader.so: EchoQuestXR's Platform SDK stand-in (Meta's needs Horizon OS)")
         if data_dir:
-            names = set(z.namelist())
             total = 0
             for lib in DATA_DIR_LIBS:
+                if lib == "libovrplatformloader.so" and LIB + NEVR_PLATFORM_ORIG not in names:
+                    continue   # Meta's loader or the stand-in, not the nevr runtime
                 if LIB + lib in names:
                     out[LIB + lib], n = relocate(out.get(LIB + lib) or z.read(LIB + lib), data_dir)
                     log(f"  {lib}: {n} game data path(s) now {data_dir}")
@@ -347,7 +364,7 @@ def patch(apk, out, log=print, data_dir=None, frame=False, standin_mic=False, pi
 
 def main():
     ap = argparse.ArgumentParser(description="Patch an Echo VR Quest APK to run on OpenXR.")
-    ap.add_argument("apk")
+    ap.add_argument("apk", nargs="?", help="Echo VR Quest APK (default: download the newest from nevr-runtime)")
     ap.add_argument("-o", "--out")
     ap.add_argument("--frame", action="store_true",
                     help=f"Steam Frame build: game data in {FRAME_DATA_DIR}, Vulkan fixes for its driver, "
@@ -358,8 +375,17 @@ def main():
     ap.add_argument("--standin-mic", action="store_true",
                     help="Quest build with the Steam Frame's microphone path (Platform SDK stand-in), for testing")
     a = ap.parse_args()
-    out = a.out or os.path.splitext(a.apk)[0] + ("_openxr_frame.apk" if a.frame else "_openxr_pico.apk" if a.pico
-                                                  else "_openxr.apk")
+    suffix = "_openxr_frame.apk" if a.frame else "_openxr_pico.apk" if a.pico else "_openxr.apk"
+    if not a.apk:
+        import device
+        try:
+            a.apk, _ = device.download_quest_apk(progress=lambda f, t: print(f"\r{t}", end="", flush=True))
+            print()
+        except Exception as e:
+            sys.exit(f"error: couldn't download Echo VR: {e}")
+        out = a.out or os.path.join(os.getcwd(), "echovr" + suffix)   # a fixed name: your key is reused next time
+    else:
+        out = a.out or os.path.splitext(a.apk)[0] + suffix
     try:
         patch(a.apk, out, data_dir=a.data_dir, frame=a.frame, standin_mic=a.standin_mic, pico=a.pico)
     except PatchError as e:

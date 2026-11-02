@@ -13,7 +13,9 @@ with its own `libvrapi.so` that implements the same functions on OpenXR. The gam
 (`libr15.so`) calls only 35 of VrApi's 114 functions, rendering is Vulkan, and nothing
 else in the APK changes.
 
-This repository ships **no game files, no APKs and no logs**. You supply your own Echo VR APK.
+This repository ships **no game files, no APKs and no logs**. The patcher downloads Echo VR's
+Quest APK itself: the newest community build from [nevr-runtime](https://github.com/EchoTools/nevr-runtime)
+(see below).
 
 ## Status
 
@@ -30,17 +32,34 @@ Tested on a Quest 3 (Horizon OS, Meta OpenXR runtime 85) and a Steam Frame (Stea
 Lepton) with Echo VR build 4987566. Controller velocities go to Echo as the OpenXR runtime
 reports them: EchoFrame doesn't tune or boost throwing.
 
-## Patching your APK (`patcher/`)
+## Patching Echo VR (`patcher/`)
 
-A step-by-step window (your headset: Quest, Steam Frame or Pico; your APK, make it, connect,
-install, button layout on the Frame, Rift Touch on a Quest, play): choose your Echo VR APK, and
-it writes a patched copy next to it.
+A step-by-step window (your headset: Quest, Steam Frame or Pico; get Echo VR, make it, connect,
+install, button layout on the Frame, Rift Touch on a Quest, play).
 **Advanced** (bottom left) is a terminal on the headset (adb shell; SteamOS on a Frame).
+
+**Get Echo VR** downloads the Quest APK: the patcher reads
+`https://evr.echo.taxi/nevr-runtime/manifest.json`, takes the newest release's artifact with
+`kind` `quest-apk`, downloads `https://evr.echo.taxi/nevr-runtime/<path>` (resumable) and checks
+its size and sha256 against the manifest. It's kept in the cache folder
+(`%LOCALAPPDATA%\EchoQuestXR\cache` for the `.exe`) and reused until a newer release comes out.
+The OpenXR version goes to `Documents\EchoFrame\echovr_openxr[_frame|_pico].apk`, always the
+same name, so your signing key is reused. You can still patch your own APK instead
+("Have your own Echo VR APK?").
+
+The nevr-runtime APK isn't OpenXR-patched: it has Meta's stock `libvrapi.so`. Its
+`libovrplatformloader.so` is the nevr runtime, which loads Meta's Platform SDK loader as
+`libovrplatformloader_orig.so`. The patcher leaves the nevr runtime in place. On Frame and
+Pico, the Platform SDK stand-in replaces `libovrplatformloader_orig.so` instead, and the Frame
+build moves the nevr runtime's game data paths (its `libr15.so` has none).
 
 ```bash
 pip install -r patcher/requirements.txt
-pythonw patcher/gui.pyw            # or: python patcher/patch.py <echo.apk> [--frame | --pico]
+pythonw patcher/gui.pyw            # or: python patcher/patch.py [<echo.apk>] [--frame | --pico]
 ```
+
+With no APK given, `patch.py` downloads the newest one and writes `echovr_openxr*.apk` into the
+current folder.
 
 A Quest build can also take the Steam Frame's microphone path (command line only):
 `--standin-mic` (the Platform SDK stand-in's microphone: 100 Hz high-pass, +6 dB with a soft
@@ -93,7 +112,7 @@ adb (Google's platform-tools) installs itself when the window opens, into
 `%LOCALAPPDATA%\EchoQuestXR` for the `.exe`. By hand:
 
 ```bash
-adb install <your-echo>_openxr.apk
+adb install echovr_openxr.apk
 ```
 
 The patcher needs the runtime libraries (`libvrapi.so`, `libopenxr_loader.so` and the Platform

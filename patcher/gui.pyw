@@ -1,9 +1,10 @@
-"""EchoFrame (the EchoQuestXR patcher) window: a step-by-step guide from your Echo VR Quest APK to Echo running
+"""EchoFrame (the EchoQuestXR patcher) window: a step-by-step guide from Echo VR's Quest APK to Echo running
 on OpenXR, on a Meta Quest, a Steam Frame or a Pico.
 
     pythonw gui.pyw      (double-click on Windows)
 
-The steps (left) are pages: which headset, your APK, make the OpenXR version (patch.py; signed
+The steps (left) are pages: which headset, get Echo VR (the newest nevr-runtime Quest APK,
+device.download_quest_apk), make the OpenXR version (patch.py; signed
 with your own random key, reused for your updates), connect the headset, install Echo and its
 game data, the Steam Frame's controls and sound (buttons.py) or, on a Quest, Rift CV1 Touch
 controllers over Wi-Fi (cv1bridge), then play and save logs (device.py). Drawn on one Canvas in EchoXR's installer style (palette and gradient from
@@ -30,7 +31,7 @@ ACCENT, ACCENT2, GOOD, WARN, BAD = "#5b8cff", "#9a6bff", "#3ddc97", "#ffb547", "
 W, H = 1000, 710
 SIDE_W = 250
 CX, CW = 290, 670            # the page's content column
-TAGS = ("quest", "frame", "pico", "pick", "out", "go", "use", "skip", "folder", "details", "data", "connect", "getadb", "install",
+TAGS = ("quest", "frame", "pico", "pick", "own", "out", "go", "use", "skip", "folder", "details", "data", "connect", "getadb", "install",
         "cv1", "cv1align", "cv1rumble",
         "launch", "logs", "back", "next", "advanced", "run", "q0", "q1", "q2", "q3", "q4", "step0", "step1", "step2", "step3", "step4", "step5", "step6")
 
@@ -47,6 +48,8 @@ def _version():
 
 
 VERSION = _version()
+# where the OpenXR version (and its signing key) is saved: one fixed name per headset, so the key is reused
+OUT_DIR = os.path.join(os.path.expanduser("~"), "Documents", "EchoFrame")
 
 if sys.platform == "win32":   # crisp on scaled displays
     try:
@@ -137,6 +140,9 @@ class App(tk.Tk):
         self.details = False
         # step 2-3: the APK and the patch
         self.apk = self.out = None
+        self.apk_version = None       # the nevr-runtime release it came from (None: the user's own APK)
+        self.fetching = False         # downloading it
+        self.fetch_progress, self.fetch_msg = 0.0, ""
         self.verdict, self.verdict_ok = "", True
         self.state = "pick"           # pick -> ready -> working -> done | error
         self.message = ""
@@ -258,7 +264,7 @@ class App(tk.Tk):
     # ------------------------------------------------------------------ the guide
     def steps(self):
         """(title, page) for each step; the Frame has one more."""
-        s = [("Your headset", self.page_headset), ("Your Echo VR APK", self.page_apk),
+        s = [("Your headset", self.page_headset), ("Get Echo VR", self.page_apk),
              ("Make the OpenXR version", self.page_build), ("Connect the headset", self.page_connect),
              ("Install", self.page_install)]
         if self.headset == "frame":
@@ -276,7 +282,7 @@ class App(tk.Tk):
         name = self.steps()[i][0]
         if name == "Your headset":
             return self.headset is not None
-        if name == "Your Echo VR APK":
+        if name == "Get Echo VR":
             return self.skip_apk or self.result is not None or (bool(self.apk) and self.verdict_ok is not None)
         if name == "Make the OpenXR version":
             return self.skip_apk or self.result is not None
@@ -288,7 +294,7 @@ class App(tk.Tk):
 
     def can_next(self):
         name = self.steps()[self.step][0]
-        if name in ("Your headset", "Your Echo VR APK", "Make the OpenXR version"):
+        if name in ("Your headset", "Get Echo VR", "Make the OpenXR version"):
             return self.step_done(self.step) and self.state != "working"
         if name == "Connect the headset":
             return self.device_ready()[0]
@@ -384,24 +390,33 @@ class App(tk.Tk):
                                "press Save logs on the last step and send the file.", "small", WARN, width=CW)
 
     def page_apk(self):
-        self.text(CX, 108, "Choose your own copy of the Echo VR Quest APK (your personalised one). The patcher reads it "
-                           "and writes a new file next to it; the original isn't changed.", "body", MUTED, width=CW)
+        self.text(CX, 108, "EchoFrame downloads Echo VR's Quest APK: the newest community build from nevr-runtime "
+                           "(evr.echo.taxi), checked against its published checksum. The next step makes the OpenXR "
+                           "version from it.", "body", MUTED, width=CW)
+        tag = () if self.fetching else ("pick",)
         hot = self.hot == "pick"
         self.rrect(CX, 186, CW, 150, 18, CARD_HI if hot else CARD,
-                   outline=mix(ACCENT, CARD, .4) if self.apk else ("#3a4150" if hot else BORDER), tags=("pick",))
-        if not self.apk:
-            self.text(CX + CW / 2, 240, "Click to choose your Echo VR APK", "big", TEXT, anchor="center", tags=("pick",))
-            self.text(CX + CW / 2, 276, "an .apk file", "small", FAINT, anchor="center", tags=("pick",))
+                   outline=mix(ACCENT, CARD, .4) if self.apk else ("#3a4150" if hot else BORDER), tags=tag)
+        if self.fetching:
+            self.text(CX + 28, 210, "DOWNLOADING", "label", FAINT)
+            self.bar(CX + 28, 246, CW - 56, self.fetch_progress)
+            self.text(CX + 28, 270, self.fetch_msg, "small", TEXT, width=CW - 56)
+        elif not self.apk:
+            self.text(CX + CW / 2, 240, "Click to download Echo VR", "big", TEXT, anchor="center", tags=tag)
+            self.text(CX + CW / 2, 276, self.fetch_msg or "about 190 MB, kept for next time", "small",
+                      BAD if self.fetch_msg else FAINT, anchor="center", width=CW - 56, tags=tag)
         else:
-            self.text(CX + 28, 210, "YOUR APK", "label", FAINT, tags=("pick",))
-            self.text(CX + 28, 232, os.path.basename(self.apk), "h", TEXT, width=CW - 140, tags=("pick",))
+            self.text(CX + 28, 210, f"ECHO VR {self.apk_version}" if self.apk_version else "YOUR APK", "label", FAINT,
+                      tags=tag)
+            self.text(CX + 28, 232, os.path.basename(self.apk), "h", TEXT, width=CW - 140, tags=tag)
             tint = GOOD if self.verdict_ok else (WARN if self.verdict_ok is False else BAD)
             self.status(CX + 28, 276, self.verdict, tint, width=CW - 56)
-            self.text(CX + CW - 28, 210, "Change", "small", ACCENT, anchor="ne", tags=("pick",))
+            self.text(CX + CW - 28, 210, "Check for a newer one", "small", ACCENT, anchor="ne", tags=tag)
         # done this before: past the APK steps
         self.text(CX, 370, "DONE THIS BEFORE?", "label", FAINT)
         self.link(CX, 394, "Already made the OpenXR version? Use that file", "use")
         self.link(CX, 422, "Echo's already set up on the headset? Skip ahead to Connect", "skip")
+        self.link(CX, 450, "Have your own Echo VR APK? Use it instead", "own")
 
     def page_build(self):
         frame = self.headset == "frame"
@@ -906,7 +921,9 @@ class App(tk.Tk):
             self.step -= 1
         elif t == "next" and self.can_next():
             self.step += 1
-        elif t == "pick" and not working:
+        elif t == "pick" and not working and not self.fetching:
+            self.fetch_apk()
+        elif t == "own" and not working and not self.fetching:
             self.pick_apk()
         elif t == "out" and self.apk and not working:
             path = filedialog.asksaveasfilename(title="Save the OpenXR version as", defaultextension=".apk",
@@ -1001,16 +1018,33 @@ class App(tk.Tk):
             if path:
                 self.dev_job(self.job_logs, serial, path)
 
+    def fetch_apk(self):
+        """Downloads the newest Echo VR Quest APK (device.download_quest_apk) in the background."""
+        self.fetching, self.fetch_progress, self.fetch_msg, self.lines = True, 0.0, "Finding the newest Echo VR...", []
+        def run():
+            def say(f, text):
+                self.msgs.put(("fetch", (f, text)))
+            try:
+                self.msgs.put(("fetched", device.download_quest_apk(log=lambda m: self.msgs.put(("log", m)),
+                                                                    progress=say)))
+            except Exception as e:
+                self.msgs.put(("fetch_error", f"Couldn't download Echo VR: {e}"))
+        threading.Thread(target=run, daemon=True).start()
+
     def pick_apk(self):
         path = filedialog.askopenfilename(title="Choose your Echo VR Quest APK",
                                           filetypes=[("Android app", "*.apk"), ("All files", "*.*")])
-        if not path:
-            return
-        self.apk = path
+        if path:
+            self.use_apk(path, None)
+
+    def use_apk(self, path, version):
+        """path is the APK to patch: version is its nevr-runtime release (saved under OUT_DIR with a fixed
+        name, so your key is reused), or None for your own APK (saved next to it)."""
+        self.apk, self.apk_version = path, version
         self.skip_apk = False
-        self.out = os.path.splitext(path)[0] + {"frame": "_openxr_frame.apk", "pico": "_openxr_pico.apk"}.get(
-            self.headset, "_openxr.apk")
-        self.state, self.lines, self.result = "ready", [], None
+        suffix = {"frame": "_openxr_frame.apk", "pico": "_openxr_pico.apk"}.get(self.headset, "_openxr.apk")
+        self.out = os.path.join(OUT_DIR, "echovr" + suffix) if version else os.path.splitext(path)[0] + suffix
+        self.state, self.result = "ready", None
         try:
             self.verdict = patch.inspect(path)
             self.verdict_ok = "hasn't seen" not in self.verdict
@@ -1019,6 +1053,10 @@ class App(tk.Tk):
             self.apk = path   # keep it shown; Next stays off
 
     def start(self):
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(self.out)), exist_ok=True)
+        except OSError:
+            pass   # patch() says what's wrong when it can't write there
         self.state, self.message, self.progress, self.lines = "working", "Reading the APK...", 0.05, []
         self.draw()
         threading.Thread(target=self.work, args=(self.apk, self.out, self.headset == "frame", self.headset == "pico"),
@@ -1068,6 +1106,13 @@ class App(tk.Tk):
                 self.state, self.result = "done", v
             elif kind == "error":
                 self.state, self.message = "error", v
+            elif kind == "fetch":
+                self.fetch_progress, self.fetch_msg = v
+            elif kind == "fetched":
+                self.fetching, self.fetch_msg = False, ""
+                self.use_apk(*v)
+            elif kind == "fetch_error":
+                self.fetching, self.fetch_msg = False, v
             elif kind == "cv1":
                 status = v.startswith(("Echo running", "Echo not answering", "no Quest yet"))
                 if status:

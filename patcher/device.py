@@ -1,5 +1,5 @@
-"""Headset side of the patcher: find adb, install the patched APK, copy Echo's game data
-over, start Echo, save logs.
+"""Headset side of the patcher: download Echo VR's Quest APK, find adb, install the patched
+APK, copy Echo's game data over, start Echo, save logs.
 
 Works with any Android headset adb can see (Quest; Steam Frame's Android container where
 it exposes adb). Save logs keeps everything Echo's process logged (its own log included),
@@ -13,6 +13,7 @@ update manifest go next to it. config.json (the community-server login) is never
 """
 import hashlib
 import io
+import json
 import os
 import re
 import shlex
@@ -35,6 +36,9 @@ MEDIA = f"/sdcard/Android/media/{PACKAGE}"
 UA = {"User-Agent": "EchoVR-Installer"}   # the game-data mirrors refuse Python's default agent
 GAME_DATA_URLS = ["https://mia.cdn.echo.taxi/_data.zip", "https://files.echovr.de/_data.zip"]
 PATCH_MANIFEST_URL = "https://files.echovr.de/updates/quest/update.manifest"
+# Echo VR's Quest APK (nevr-runtime's community build, which the patcher starts from): the
+# newest release's "quest-apk" artifact in its manifest, at NEVR_BASE + its path
+NEVR_BASE = "https://evr.echo.taxi/nevr-runtime/"
 SAFE_PATH = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./-]*$")
 # Android tools by full path too: a headset shell whose PATH lacks /system/bin (seen on
 # Steam Frame) answers "logcat: not found" otherwise
@@ -472,6 +476,68 @@ def fetch(url, path, progress=None):
     if total and done != total:
         raise IOError(f"download cut short ({done} of {total} bytes); try again to resume")
     os.replace(tmp, path)
+
+
+def _version_key(v):
+    return tuple(int(p) if p.isdigit() else -1 for p in re.split(r"[.+-]", v))
+
+
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def latest_quest_apk():
+    """(version, artifact) for the newest release in nevr-runtime's manifest that has a quest-apk;
+    the artifact has its name, path, size and sha256."""
+    with urllib.request.urlopen(urllib.request.Request(NEVR_BASE + "manifest.json", headers=UA), timeout=30) as r:
+        manifest = json.loads(r.read().decode("utf-8"))
+    releases = manifest.get("releases") or {}
+    for version in sorted(releases, key=_version_key, reverse=True):
+        for a in releases[version].get("artifacts", []):
+            if a.get("kind") == "quest-apk":
+                if not SAFE_PATH.match(a["path"]) or ".." in a["path"] or "/" in a["name"] or not SAFE_PATH.match(a["name"]):
+                    raise IOError(f"unexpected path in the release list: {a['path']}")
+                return version, a
+    raise IOError("the release list has no Quest APK")
+
+
+def download_quest_apk(log=print, progress=None):
+    """Downloads the newest Echo VR Quest APK into <DATA>/cache, checking its size and sha256 (a copy
+    already there is reused while it's the newest). Returns (path, version). progress(fraction, text)."""
+    say = progress or (lambda f, t: None)
+    say(0, "Finding the newest Echo VR...")
+    version, a = latest_quest_apk()
+    cache = os.path.join(DATA, "cache")
+    os.makedirs(cache, exist_ok=True)
+    path = os.path.join(cache, a["name"])
+    want = a["sha256"].lower()
+    if os.path.isfile(path) and os.path.getsize(path) == a["size"]:
+        say(0.97, "Checking the APK you downloaded earlier...")
+        if _sha256(path) == want:
+            log(f"Echo VR {version}: {a['name']} (downloaded earlier)")
+            return path, version
+    if shutil.disk_usage(cache).free < a["size"] + 50_000_000:
+        raise IOError(f"not enough free space in {cache}: Echo VR's APK is {a['size'] / 1e6:.0f} MB")
+    url = NEVR_BASE + a["path"]
+    log(f"Downloading Echo VR {version} from {url}")
+    fetch(url, path, lambda d, t: say(0.95 * d / t if t else 0,
+                                      f"Downloading Echo VR {version}: {d / 1e6:.0f} of {t / 1e6:.0f} MB"))
+    say(0.97, "Checking the download...")
+    if os.path.getsize(path) != a["size"] or _sha256(path) != want:
+        os.remove(path)
+        raise IOError("the downloaded APK didn't match its checksum; try again")
+    log(f"  sha256 {want} (matches the release list)")
+    for old in os.listdir(cache):   # earlier versions aren't needed any more
+        if old != a["name"] and old.startswith("nevr-runtime-") and old.endswith("-quest.apk"):
+            try:
+                os.remove(os.path.join(cache, old))
+            except OSError:
+                pass
+    return path, version
 
 
 def shell(adb, serial, cmd, timeout=60):

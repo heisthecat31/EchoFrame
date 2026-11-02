@@ -23,20 +23,22 @@ OPENXR_SDK = os.environ.get("OPENXR_SDK", os.path.join(ROOT, "..", "EchoVR-Hand-
 
 README = """EchoFrame v{version}
 ==========================
-Makes your Echo VR Quest APK run on OpenXR: on Quest (Meta's OpenXR runtime), on a
+Makes Echo VR's Quest APK run on OpenXR: on Quest (Meta's OpenXR runtime), on a
 Steam Frame, and on Pico (new, not tried on a Pico yet). On a Quest it can also use
 Rift CV1 Touch controllers over Wi-Fi (the Rift Touch step; cv1bridge.exe is inside).
 
 1. Run EchoFrame-v{version}.exe (Windows may warn about an unknown
    publisher: More info -> Run anyway).
-2. Choose your own Echo VR Quest APK. Nothing is uploaded; the original isn't changed.
-3. Patch and sign. The APK is signed with your own random key, saved next to it as
-   .signing-key.pem (keep it private). Patching to the same file again reuses that
-   key, so updates keep Echo's data (a new key means Echo gets reinstalled, which
-   deletes its data, and on Steam Frame its game data).
+2. Get Echo VR: the window downloads the newest Echo VR Quest APK from nevr-runtime
+   (evr.echo.taxi), checked against its published sha256. Nothing is uploaded. (You
+   can still choose your own APK instead.)
+3. Patch and sign. The APK is saved to Documents\EchoFrame and signed with your own
+   random key, saved next to it as .signing-key.pem (keep it private). Making it again
+   reuses that key, so updates keep Echo's data (a new key means Echo gets reinstalled,
+   which deletes its data, and on Steam Frame its game data).
 4. Install:
-   The window walks you through it step by step (Your headset, APK, Make it, Connect,
-   Install, Play).
+   The window walks you through it step by step (Your headset, Get Echo VR, Make it,
+   Connect, Install, Play).
    - Quest: turn on Developer Mode, plug in with USB, allow USB debugging. Android only
      updates an app signed with the same key, so the window asks before uninstalling an
      Echo VR signed with another key (that removes Echo's app data on the headset; the
@@ -68,10 +70,11 @@ platform-tools) installs itself when the window opens.
 The patch changes three things in the APK: lib/arm64-v8a/libvrapi.so (VrApi on
 OpenXR), lib/arm64-v8a/libopenxr_loader.so (Khronos OpenXR loader) and the manifest
 (launcher entry for Steam Frame, OpenXR permissions). The Steam Frame build also
-changes libr15.so and libassetpatch.so (game data folder, Vulkan fixes); the Steam Frame
-and Pico builds replace lib/arm64-v8a/libovrplatformloader.so with a stand-in for Meta's
-Platform SDK, which they don't have (the Pico build also adds Pico's VR launch entries
-to the manifest). Everything else is copied as is. EchoFrame doesn't change how throwing
+changes libr15.so (Vulkan fixes) and moves Echo's game data folder; the Steam Frame
+and Pico builds put a stand-in for Meta's Platform SDK, which they don't have, in place
+of Meta's loader (libovrplatformloader_orig.so under nevr-runtime's
+libovrplatformloader.so, which stays). The Pico build also adds Pico's VR launch
+entries to the manifest. Everything else is copied as is. EchoFrame doesn't change how throwing
 works: controller speeds go to Echo as the headset reports them.
 """
 
