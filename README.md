@@ -98,7 +98,12 @@ uninstall an app whose key changed, which deletes its app data, and on Steam Fra
 The later steps do the rest, over USB (or, on a Frame, its Wi-Fi adb address):
 - **Install**: the patched APK (if Echo VR on the headset was signed with another key, it asks
   before uninstalling it; that removes Echo's app data on the headset), then, ticked by
-  default, **Echo's game data**: `_data.zip` from the same mirrors as the
+  default, **Echo's game data**. For nevr-runtime's Echo (what Get Echo VR downloads) that is
+  nevr's own game data: its release's `game-data` zip (1.6 GB: stock plus its pinned pack
+  `48037dc70b0ecab2`). nevr's APK carries level scripts built for that data, and with the older
+  data Echo crashed loading the social lobby (a script sends an event to a game space that isn't
+  there). Each file the release lists is checked on the headset (size, then sha256), and the zip is
+  downloaded only when one is missing or different; only those files are copied. Otherwise: `_data.zip` from the same mirrors as the
   [Echo VR installer app](https://github.com/heisthecat31/EchoVR-Installer) (about 900 MB,
   downloaded once, resumable), copied to `/sdcard/Android/media/com.readyatdawn.r15/files/`
   where Echo reads it, plus the installer's asset patches (sha256-checked). A headset that

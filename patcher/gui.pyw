@@ -48,6 +48,7 @@ def _version():
 
 
 VERSION = _version()
+NAMES = {"quest": "Meta Quest", "frame": "Steam Frame", "pico": "Pico"}
 # where the OpenXR version (and its signing key) is saved: one fixed name per headset, so the key is reused
 OUT_DIR = os.path.join(os.path.expanduser("~"), "Documents", "EchoFrame")
 
@@ -821,7 +822,7 @@ class App(tk.Tk):
                 self.msgs.put(("devmsg", (f"Install failed: {text}", BAD)))
                 return
         if with_data:
-            self.job_data(serial)
+            self.job_data(serial, apk)
         if device.frame_info(self.adb, serial):   # Steam Frame: its controls, sound and SteamVR settings too
             try:
                 for line in device.write_buttons(self.adb, serial, buttons.to_text(self.btn_map)).splitlines():
@@ -832,12 +833,17 @@ class App(tk.Tk):
         self.msgs.put(("installed", True))
         self.msgs.put(("devmsg", ("Installed. Press Next.", GOOD)))
 
-    def job_data(self, serial):
+    def job_data(self, serial, apk=None):
         def progress(f, text):
             self.msgs.put(("devprogress", f))
             self.msgs.put(("devmsg", (text, MUTED)))
+        # nevr-runtime's Echo needs nevr's game data; Echo already on the headset (no APK here):
+        # the one this window made, which is nevr's unless you chose your own APK
+        apk = apk or self.installable() or (self.apk if self.apk_version else None)
+        nevr = patch.is_nevr(apk) if apk else bool(self.apk_version or not self.apk)
         try:
-            device.install_game_data(self.adb, serial, log=lambda m: self.msgs.put(("log", m)), progress=progress)
+            device.install_game_data(self.adb, serial, log=lambda m: self.msgs.put(("log", m)), progress=progress,
+                                     nevr=nevr)
         finally:
             self.msgs.put(("devprogress", None))
 
@@ -937,10 +943,20 @@ class App(tk.Tk):
             path = filedialog.askopenfilename(title="Choose the OpenXR version you made earlier",
                                               filetypes=[("Android app", "*.apk")])
             if path:
+                try:
+                    built = patch.built_info(path)
+                except patch.PatchError as e:
+                    messagebox.showerror("EchoFrame", f"{os.path.basename(path)}: {e}")
+                    return
+                want = self.headset or "quest"
+                if built != want and not messagebox.askyesno(
+                        "EchoFrame", f"{os.path.basename(path)} was made for {NAMES.get(built, built)}, not "
+                                     f"{NAMES.get(want, want)}. Use it anyway?"):
+                    return
                 self.out = path
                 key = os.path.splitext(path)[0] + ".signing-key.pem"
                 self.result = (path, key, "")
-                self.built_for_frame = path.endswith("_frame.apk") or self.headset == "frame"
+                self.built_for_frame = built == "frame"
                 self.state = "done"
                 self.skip_apk = False
                 self.go_to("Connect the headset")

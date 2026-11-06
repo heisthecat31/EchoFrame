@@ -144,6 +144,42 @@ def inspect(apk):
         return "Echo VR Quest APK with Meta's VrApi 1.1.40 (build 4987566 or compatible)"
 
 
+def is_nevr(apk):
+    """True for nevr-runtime's Echo VR (its runtime is libovrplatformloader.so, over Meta's loader)."""
+    try:
+        with zipfile.ZipFile(apk) as z:
+            return LIB + NEVR_PLATFORM_ORIG in z.namelist()
+    except (zipfile.BadZipFile, OSError):
+        return False
+
+
+def built_info(apk):
+    """What an APK chosen as "the OpenXR version you made earlier" is: 'quest', 'frame' or 'pico'.
+    Raises PatchError if it isn't an EchoQuestXR build (an original Echo VR APK has no LAUNCHER
+    entry, so Lepton on Steam Frame won't start it: "APP_ACTIVITY is empty")."""
+    try:
+        z = zipfile.ZipFile(apk)
+    except (zipfile.BadZipFile, OSError) as e:
+        raise PatchError(f"Not an APK (zip): {e}")
+    with z:
+        names = set(z.namelist())
+        if "AndroidManifest.xml" not in names or LIB + "libr15.so" not in names:
+            raise PatchError("This isn't an Echo VR APK.")
+        if LIB + "libopenxr_loader.so" not in names or LIB + "libvrapi.so" not in names \
+                or hashlib.sha256(z.read(LIB + "libvrapi.so")).hexdigest() == META_VRAPI_SHA256:
+            raise PatchError("This is an original Echo VR APK, not the OpenXR version: make it in the step before.")
+        manifest = axml.Manifest(z.read("AndroidManifest.xml"))
+        if manifest.index("android.intent.category.LAUNCHER") < 0:
+            raise PatchError("This APK has no launcher entry (Steam Frame won't start it): make it again.")
+        if manifest.index(axml.PICO_VR_CATEGORY) >= 0:
+            return "pico"
+        what, find, at, new = FRAME_CODE_PATCHES[0]   # the Vulkan 1.0 fix: only the Frame build has it
+        find, new = bytes.fromhex(find), bytes.fromhex(new)
+        if z.read(LIB + "libr15.so").find(find[:at] + new + find[at + len(new):]) >= 0:
+            return "frame"
+        return "quest"
+
+
 # ---------------------------------------------------------------------------
 # signing
 # ---------------------------------------------------------------------------
@@ -239,7 +275,12 @@ def frame_code(data, log=print, patches=None, lib="libr15.so"):
     data = bytearray(data)
     for what, find, at, new in (FRAME_CODE_PATCHES if patches is None else patches):
         find, new = bytes.fromhex(find), bytes.fromhex(new)
+        done = find[:at] + new + find[at + len(new):]   # the same code with this patch in it
         i = data.find(find)
+        if i < 0 and data.count(done) == 1:
+            # nevr-runtime's newer APKs ship some of these changes already
+            log(f"  {lib}: already in this APK: {what}")
+            continue
         if i < 0 or data.find(find, i + 1) >= 0:
             raise PatchError(f"Couldn't find the code to change in {lib} ({what}); "
                              "the Steam Frame build is made for Echo VR build 4987566")

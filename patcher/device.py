@@ -396,9 +396,16 @@ def frame_crash_dump(adb, serial, path):
         f.write(dump)
     lines = [f"{name} ({len(dump)} bytes, saved as {os.path.basename(local)})"]
     try:
-        return lines + minidump.summary(dump)
+        lines += minidump.summary(dump)
     except (minidump.MinidumpError, struct.error) as e:
-        return lines + [f"couldn't read it: {e}"]
+        lines += [f"couldn't read it: {e}"]
+    # Echo's own log up to the crash, written next to the dump (<id>.log): what it was loading, its
+    # errors. Lepton's logcats don't have Echo's lines once its container has stopped.
+    log = name[:-4] + ".log"
+    if re.fullmatch(r"/[A-Za-z0-9_./-]+\.log", log):   # it goes into a quoted shell command
+        code, text = shell(adb, serial, f"podman unshare cat '{log}' 2>&1", timeout=120)
+        lines += ["", f"=== Echo's log for this crash ({os.path.basename(log)})"] + text.rstrip().splitlines()
+    return lines
 
 
 
@@ -490,19 +497,28 @@ def _sha256(path):
     return h.hexdigest()
 
 
-def latest_quest_apk():
-    """(version, artifact) for the newest release in nevr-runtime's manifest that has a quest-apk;
-    the artifact has its name, path, size and sha256."""
+def _latest_artifact(kind):
+    """(version, artifact) of the given kind from the newest nevr-runtime release that has a quest-apk."""
     with urllib.request.urlopen(urllib.request.Request(NEVR_BASE + "manifest.json", headers=UA), timeout=30) as r:
         manifest = json.loads(r.read().decode("utf-8"))
     releases = manifest.get("releases") or {}
     for version in sorted(releases, key=_version_key, reverse=True):
-        for a in releases[version].get("artifacts", []):
-            if a.get("kind") == "quest-apk":
+        arts = releases[version].get("artifacts", [])
+        if not any(a.get("kind") == "quest-apk" for a in arts):
+            continue
+        for a in arts:
+            if a.get("kind") == kind:
                 if not SAFE_PATH.match(a["path"]) or ".." in a["path"] or "/" in a["name"] or not SAFE_PATH.match(a["name"]):
                     raise IOError(f"unexpected path in the release list: {a['path']}")
                 return version, a
+        raise IOError(f"nevr-runtime {version} has no {kind}")
     raise IOError("the release list has no Quest APK")
+
+
+def latest_quest_apk():
+    """(version, artifact) for the newest release in nevr-runtime's manifest that has a quest-apk;
+    the artifact has its name, path, size and sha256."""
+    return _latest_artifact("quest-apk")
 
 
 def download_quest_apk(log=print, progress=None):
@@ -769,9 +785,79 @@ def game_data_on_headset(adb, serial):
     return Storage(adb, serial).has_game_data()
 
 
-def install_game_data(adb, serial, log=print, progress=None):
+def install_nevr_game_data(store, cache, log=print, say=None):
+    """nevr-runtime's game data (its release's game-data zip: stock plus its pinned packs). Its APK's
+    level scripts are built for that data: with the installer's older _data.zip, the social lobby's
+    scripts look for a game space that isn't there and Echo crashes as it loads (seen on a Steam
+    Frame: CSendEventNode::Enter, null game space). Each file the release lists is checked on the
+    headset (size, then sha256); the zip is downloaded only when one is missing or different, and
+    only those files are copied."""
+    say = say or (lambda f, t: None)
+    say(0.01, "Finding nevr-runtime's game data...")
+    version, art = _latest_artifact("game-data")
+    contents = art.get("contents") or []
+    for c in contents:
+        if not SAFE_PATH.match(c["path"]) or ".." in c["path"] or not c["path"].startswith("_data/"):
+            raise IOError(f"unexpected file in nevr-runtime's game data: {c['path']}")
+    if not contents:
+        raise IOError("nevr-runtime's release list doesn't say what its game data holds")
+    there = store.sizes("files/_data")
+    need = []
+    for n, c in enumerate(contents, 1):
+        rel = f"files/{c['path']}"
+        say(0.02, f"Checking the game data on the headset (file {n} of {len(contents)})...")
+        if there.get(rel) != c["size"] or store.sha256(rel) != c["sha256"].lower():
+            need.append(c)
+    if not need:
+        log(f"Game data: nevr-runtime {version}'s is on the headset ({len(contents)} files checked)")
+        return
+    log(f"Game data: {len(need)} of {len(contents)} files missing or different from nevr-runtime {version}'s: "
+        + ", ".join(os.path.basename(c["path"]) for c in need))
+    store.check_writable()
+    zpath = os.path.join(cache, art["name"])
+    if not (os.path.isfile(zpath) and os.path.getsize(zpath) == art["size"]):
+        free = shutil.disk_usage(cache).free - (os.path.getsize(zpath + ".partial") if os.path.isfile(zpath + ".partial") else 0)
+        if free < art["size"] + max(c["size"] for c in need) + 200_000_000:
+            raise IOError(f"not enough free space in {cache}: nevr-runtime's game data is "
+                          f"{art['size'] / 1e9:.1f} GB, plus room to unpack it")
+        url = NEVR_BASE + art["path"]
+        log(f"Downloading game data from {url}")
+        fetch(url, zpath, lambda d, t: say(0.05 + 0.45 * d / t if t else 0.05,
+                                           f"Downloading game data: {d / 1e6:.0f} of {t / 1e6:.0f} MB"))
+    tmpdir = os.path.join(cache, "push")
+    bad = None
+    with zipfile.ZipFile(zpath) as z:
+        names = set(z.namelist())
+        total = sum(c["size"] for c in need) or 1
+        done = 0
+        for n, c in enumerate(need, 1):
+            if c["path"] not in names:
+                bad = f"nevr-runtime's game data zip has no {c['path']}"
+                break
+            label = f"Copying game data to the headset (file {n} of {len(need)})"
+            say(0.5 + 0.45 * done / total, label + ": unpacking...")
+            local = z.extract(c["path"], tmpdir)
+            try:
+                if _sha256(local) != c["sha256"].lower():
+                    bad = f"{c['path']} in the downloaded game data didn't match its checksum; try again"
+                    break
+                store.put(local, f"files/{c['path']}", lambda b, d=done: say(
+                    0.5 + 0.45 * (d + b) / total, f"{label}: {(d + b) / 1e6:.0f} of {total / 1e6:.0f} MB"))
+            finally:
+                os.remove(local)
+            done += c["size"]
+            log(f"  copied {c['path']}")
+    shutil.rmtree(tmpdir, ignore_errors=True)
+    if bad:
+        os.remove(zpath)   # a bad download isn't kept for next time
+        raise IOError(bad)
+    os.remove(zpath)   # on the headset now: give the PC its space back
+
+
+def install_game_data(adb, serial, log=print, progress=None, nevr=False):
     """Downloads Echo's game data once (kept in <DATA>/cache until it's on a headset) and copies
-    over what the headset doesn't have yet, then the asset patches. progress(fraction, text)."""
+    over what the headset doesn't have yet, then the asset patches. progress(fraction, text).
+    nevr: Echo is nevr-runtime's build, so its own game data (install_nevr_game_data)."""
     say = progress or (lambda f, t: None)
     cache = os.path.join(DATA, "cache")
     os.makedirs(cache, exist_ok=True)
@@ -779,6 +865,13 @@ def install_game_data(adb, serial, log=print, progress=None):
     store = Storage(adb, serial)
     if store.frame:
         log(f"Steam Frame: Echo's storage is {store.base}")
+    if nevr:
+        install_nevr_game_data(store, cache, log, say)
+        say(0.96, "Checking the asset patches...")
+        install_asset_patches(store, cache, log, say)
+        store.done()
+        say(1.0, "Game data installed (nevr-runtime's); asset patches up to date.")
+        return
     if store.has_game_data():
         # Never copy over an existing install: Echo updates its data itself (a headset can
         # hold newer manifests and extra packages than the zip), so the zip could downgrade it
