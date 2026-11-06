@@ -38,6 +38,7 @@
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/system_properties.h>
 #include <time.h>
@@ -836,15 +837,99 @@ void Barrier(VkImage img, uint32_t layers, VkImageLayout from, VkImageLayout to,
 // tangent space (fraction of the half-field), centred where the eye looks straight ahead: the
 // Frame's views are off-centre (fov -0.95/0.88 left/right, 0.80/-1.04 up/down for the left
 // eye). Echo's rows run bottom-up, so row 0 is the bottom of the view. Level: the patcher's
-// Steam Frame "Foveation=" (default medium), or debug.echoquestxr.foveation; Quest: off.
+// Steam Frame "Foveation=" (default medium), or debug.echoquestxr.foveation; Quest: off. In game,
+// the "Foveated Rendering" row the patcher adds to Echo's GRAPHICS page turns it off and on
+// (EchoFoveation).
+
+// Echo's "Foveated Rendering" row: Echo saves it as graphics|adaptiveresolution (a setting it saves
+// but doesn't use on Android: ApplyRuntimeGfxSettings always calls SetEnableAutoResolution(0)) in
+// <files>/RAD/LoneEcho/settings_mp_v2_quest.json (settings_mp_v2.json for other headset types),
+// every time a setting changes (ApplyGameSettingsChanges -> SaveSettings). <files> is Android's
+// getFilesDir or getExternalFilesDir. Checked about once a second; the maps are refilled on a change.
+struct EchoFoveationState {
+    bool read = false;
+    bool off = false;          // the row is Off
+    std::string path;          // the settings file read last
+    time_t mtime = 0;
+};
+EchoFoveationState g_echoFoveation;
+
+// The newest of Echo's settings files, and its modification time; "" if there's none
+std::string EchoSettingsFile(time_t* mtime) {
+    static const char* const dirs[] = { "/data/data/com.readyatdawn.r15/files", "/data/user/0/com.readyatdawn.r15/files",
+                                        "/sdcard/Android/data/com.readyatdawn.r15/files" };
+    static const char* const names[] = { "settings_mp_v2_quest.json", "settings_mp_v2.json" };
+    std::string best;
+    *mtime = 0;
+    for (const char* d : dirs)
+        for (const char* n : names) {
+            std::string p = std::string(d) + "/RAD/LoneEcho/" + n;
+            struct stat st;
+            if (stat(p.c_str(), &st) == 0 && (best.empty() || st.st_mtime > *mtime)) { best = p; *mtime = st.st_mtime; }
+        }
+    return best;
+}
+
+// graphics|adaptiveresolution in Echo's settings file: 1 on, 0 off, -1 not there
+int ReadEchoFoveation(const std::string& path) {
+    FILE* f = fopen(path.c_str(), "re");
+    if (!f) return -1;
+    std::string text;
+    char buf[4096];
+    for (size_t n; (n = fread(buf, 1, sizeof buf, f)) > 0 && text.size() < (1u << 20);) text.append(buf, n);
+    fclose(f);
+    size_t at = text.find("\"adaptiveresolution\"");
+    if (at == std::string::npos) return -1;
+    at = text.find(':', at);
+    if (at == std::string::npos) return -1;
+    at = text.find_first_not_of(" \t\r\n", at + 1);
+    if (at == std::string::npos) return -1;
+    if (!text.compare(at, 4, "true") || text[at] == '1') return 1;
+    if (!text.compare(at, 5, "false") || text[at] == '0') return 0;
+    return -1;
+}
+
+// Re-reads Echo's setting when its file has changed. Returns true if On/Off changed.
+bool UpdateEchoFoveation() {
+    time_t mtime = 0;
+    std::string path = EchoSettingsFile(&mtime);
+    EchoFoveationState& e = g_echoFoveation;
+    if (e.read && path == e.path && mtime == e.mtime) return false;
+    bool first = !e.read, was = e.off;
+    e.read = true;
+    e.path = path;
+    e.mtime = mtime;
+    int v = path.empty() ? -1 : ReadEchoFoveation(path);
+    e.off = v == 0;
+    if (first || e.off != was)
+        LOG("foveated rendering (Echo's GRAPHICS page): %s%s%s", e.off ? "off" : "on",
+            path.empty() ? " (no settings file yet)" : v < 0 ? " (not set)" : "", first ? "" : ", changed in game");
+    return !first && e.off != was;
+}
+
 std::string FoveationLevel() {
-    static std::string level = [] {
-        char prop[PROP_VALUE_MAX] = "";
-        __system_property_get("debug.echoquestxr.foveation", prop);
-        if (prop[0]) return std::string(prop);
-        return g.flipCopy ? FrameSettings().foveation : std::string("off");   // flip copy: not Meta's runtime
+    static const std::string prop = [] {
+        char p[PROP_VALUE_MAX] = "";
+        __system_property_get("debug.echoquestxr.foveation", p);
+        return std::string(p);
     }();
-    return level;
+    if (!prop.empty()) return prop;
+    if (!g.flipCopy) return "off";   // flip copy: not Meta's runtime
+    if (!g_echoFoveation.read) UpdateEchoFoveation();
+    return g_echoFoveation.off ? "off" : FrameSettings().foveation;
+}
+
+// From vrapi_SubmitFrame2 about once a second (Echo's render thread, between its frames): when the
+// row has changed, every swapchain's foveation maps are refilled. The fill is submitted on the
+// queue Echo renders on, after its earlier work (barriers on all commands), and waited for.
+void CheckEchoFoveation() {
+    char p[PROP_VALUE_MAX] = "";
+    if (!g.flipCopy || __system_property_get("debug.echoquestxr.foveation", p) > 0) return;
+    if (!UpdateEchoFoveation()) return;
+    int n = 0;
+    for (Swapchain* s : g.swapchains)
+        if (!s->fdm.empty()) { FillFoveationMaps(s); ++n; }
+    LOG("foveation maps refilled (%s) on %d swapchain(s)", FoveationLevel().c_str(), n);
 }
 
 // density (0..255) for one texel at (u, v) in [0, 1], with the view's centre at (cu, cv)
@@ -2880,6 +2965,8 @@ float RefreshRate() {
     return 1.0f / (float)g.period;
 }
 
+constexpr float FRAME_DEFAULT_HZ = 120.f;   // Steam Frame's default rate (Refresh= overrides it)
+
 const std::vector<float>& RefreshRates() {
     if (g.rates.empty() && g.enumerateRates && g.session) {
         uint32_t n = 0;
@@ -2889,12 +2976,29 @@ const std::vector<float>& RefreshRates() {
         }
     }
     if (g.rates.empty()) g.rates = { RefreshRate() };
+    // SteamVR (Steam Frame): xrEnumerateDisplayRefreshRatesFB lists only the current rate (72),
+    // though the Frame's display has 72/80/90/96/108/120/144 Hz modes and xrRequestDisplayRefreshRateFB
+    // switches between them (vrserver: "Request to change refresh to ...Hz", "Selected display
+    // mode"). Echo asks for the highest rate it's offered (CR15Game's UpdateTracking: "Maxrate"),
+    // so it stayed at 72. Offered 72/90/120/144 it asks for 144, and vrapi_SetDisplayRefreshRate
+    // requests 120 unless the "Refresh=" setting says otherwise (FRAME_DEFAULT_HZ).
+    if (!g.meta && !g.pico && g.rates.size() <= 1 && g.session) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            LOG("refresh rates: SteamVR listed %.0f only; offering Echo 72, 90, 120 and 144", g.rates[0]);
+        }
+        g.rates = { 72.f, 90.f, 120.f, 144.f };
+    }
     return g.rates;
 }
 
 EXPORT int32_t vrapi_GetSystemPropertyInt(const vr::Java*, int32_t prop) {
     switch (prop) {
-    case 0: return 320;   // device type: Quest 3 (keeps Echo on its Quest 3 settings)
+    // device type: 320 is VrApi's Quest 2 (Echo's newest). Echo only uses it to name the device in
+    // its log ("Device type 'Quest 2' is setting refresh rate to ..."); the rate it asks for is the
+    // highest one it's offered (RefreshRates)
+    case 0: return 320;
     case 7: return 108;   // suggested eye FOV, degrees
     case 8: return 110;
     case 64: return (int32_t)RefreshRates().size();
@@ -2930,8 +3034,8 @@ EXPORT int32_t vrapi_ShowSystemUI(const vr::Java*, int32_t) { return vr::kSucces
 
 EXPORT int32_t vrapi_SetDisplayRefreshRate(void*, float rate) {
     if (g.requestRate && g.session) {
-        // Steam Frame: the patcher's "Refresh=" setting replaces Echo's request (72 Hz), or
-        // with Refresh=default nothing is requested and SteamVR keeps its own rate
+        // Steam Frame: Echo asks for 120 Hz (RefreshRates); the patcher's "Refresh=" setting
+        // replaces that, or with Refresh=default nothing is requested and SteamVR keeps its own rate
         const std::string& want = FrameSettings().refresh;
         std::string rates;
         for (float f : RefreshRates()) rates += std::to_string((int)f) + " ";
@@ -2940,6 +3044,9 @@ EXPORT int32_t vrapi_SetDisplayRefreshRate(void*, float rate) {
             return vr::kSuccess;
         }
         if (!want.empty()) rate = (float)atof(want.c_str());
+        // SteamVR (Steam Frame): 120 Hz unless "Refresh=" asks for another rate (Echo asks for the
+        // highest offered, 144)
+        else if (!g.meta && !g.pico && rate > FRAME_DEFAULT_HZ) rate = FRAME_DEFAULT_HZ;
         // Pico 4: Echo asks it for 90 Hz, which its GPU doesn't hold (46-79 frames a second, a
         // stutter on every missed frame); 72, as on a Quest
         else if (g.pico && rate > 72) rate = 72;
@@ -3366,6 +3473,7 @@ EXPORT int32_t vrapi_SubmitFrame2(void*, const vr::SubmitFrameDescription2* desc
     g.latency += ToSeconds(g.frame.predictedDisplayTime) - Now();
     GpuFrameCollect(g.submitted);
     g.begun = g.waited = false;
+    if (g.submitted % 72 == 71) CheckEchoFoveation();   // Echo's Foveated Rendering row, about once a second
     if (++g.submitted == 1 || g.submitted % 720 == 0) {
         LOG("frame %llu submitted (%zu layer(s), %.0f Hz, image mismatches so far %llu)", (unsigned long long)g.submitted,
             layers.size(), 1.0 / g.period, (unsigned long long)(g.swapchains.empty() ? 0 : g.swapchains[0]->mismatches));

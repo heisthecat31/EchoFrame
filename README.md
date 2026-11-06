@@ -103,12 +103,23 @@ The later steps do the rest, over USB (or, on a Frame, its Wi-Fi adb address):
   `48037dc70b0ecab2`). nevr's APK carries level scripts built for that data, and with the older
   data Echo crashed loading the social lobby (a script sends an event to a game space that isn't
   there). Each file the release lists is checked on the headset (size, then sha256), and the zip is
-  downloaded only when one is missing or different; only those files are copied. Otherwise: `_data.zip` from the same mirrors as the
+  downloaded only when one is missing or different; only those files are copied. The EchoVR
+  installer's asset patches, made for older data, are removed (only files whose sha256 is still
+  the one the installer's list gives): `libassetpatch.so` loaded them over nevr's data, and
+  weapons lost their bullet effects. Otherwise: `_data.zip` from the same mirrors as the
   [Echo VR installer app](https://github.com/heisthecat31/EchoVR-Installer) (about 900 MB,
   downloaded once, resumable), copied to `/sdcard/Android/media/com.readyatdawn.r15/files/`
-  where Echo reads it, plus the installer's asset patches (sha256-checked). A headset that
+  where Echo reads it. A headset that
   already has game data is left as it is (Echo updates it itself; the zip could be older),
   and `config.json` (the community-server login) is never touched.
+- **Steam Frame and Pico builds** add a **Foveated Rendering** row (On/Off) to Echo's GRAPHICS
+  settings page, next to nevr's Texture Resolution. Echo's Quest build never does dynamic
+  resolution (`ApplyRuntimeGfxSettings` always calls `SetEnableAutoResolution(0)`; its resolution
+  scales are 1.0): what lowers the resolution towards the edges is EchoFrame's fixed foveation.
+  The row uses the adaptive-resolution setting, which Echo saves but doesn't use on Android; the
+  runtime reads Echo's settings file about once a second and refills its foveation maps on a
+  change. On a Steam Frame, SteamVR lists only 72 Hz to apps, so the runtime offers Echo 72/90/
+  120/144 and asks SteamVR for 120 (`Refresh=` in the settings file overrides it).
 - **Launch**, and **Save logs** (everything Echo's process logged, its own log included, plus
   the crash log and the OpenXR runtime's lines). If the headset's shell
   can't run `logcat`, the saved file says what that shell is instead.

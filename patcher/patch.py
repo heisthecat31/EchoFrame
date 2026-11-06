@@ -289,6 +289,32 @@ def frame_code(data, log=print, patches=None, lib="libr15.so"):
     return bytes(data)
 
 
+# Echo's settings menu, and the row EchoQuestXR adds to its GRAPHICS page (Steam Frame and Pico builds,
+# where the runtime does the foveation): "Foveated Rendering" on or off. It uses the adaptive
+# resolution setting, which Echo saves but doesn't use on Android (ApplyRuntimeGfxSettings always
+# calls SetEnableAutoResolution(0)); the runtime reads it from the settings file Echo saves on each
+# change, about once a second, and refills its foveation maps (runtime: CheckEchoFoveation).
+MENU_SETTINGS = "assets/sourcedb/rad15/json/r14/config/uisettings/menu_settings.json"
+FOVEATION_ROW = {"path": "graphics|adaptiveresolution", "name": "Foveated Rendering", "value": True,
+                 "type": "NAMED FLAG", "falsestr": "Off", "truestr": "On"}
+
+
+def menu_settings(data, log=print):
+    """Echo's menu_settings.json with the Foveated Rendering row on its GRAPHICS page (after nevr's
+    Texture Resolution); unchanged if it's already there."""
+    import json
+    menu = json.loads(data.decode("utf-8-sig"))
+    pages = [p for p in menu.get("pages", []) if p.get("name") == "GRAPHICS"]
+    if not pages:
+        raise PatchError("Echo's settings menu has no GRAPHICS page")
+    rows = pages[0].setdefault("rows", [])
+    if any(r.get("path") == FOVEATION_ROW["path"] for r in rows):
+        return data
+    rows.append(dict(FOVEATION_ROW))
+    log("  menu_settings.json: GRAPHICS page has Foveated Rendering (on/off, in game)")
+    return json.dumps(menu, indent=4).encode("utf-8")
+
+
 def changes(apk, runtime, log=print, data_dir=None, frame_fixes=False, standin_mic=False, pico=False):
     """{entry name: new bytes}: every change EchoQuestXR makes to an Echo VR APK. data_dir:
     where Echo reads its game data instead of /sdcard/Android/media/<package>; frame_fixes:
@@ -304,6 +330,10 @@ def changes(apk, runtime, log=print, data_dir=None, frame_fixes=False, standin_m
         out["AndroidManifest.xml"] = axml.patch_manifest(z.read("AndroidManifest.xml"), log, pico=pico)
         if frame_fixes:
             out[LIB + "libr15.so"] = frame_code(z.read(LIB + "libr15.so"), log)
+        if (frame_fixes or pico) and MENU_SETTINGS in names:
+            menu = menu_settings(z.read(MENU_SETTINGS), log)
+            if menu != z.read(MENU_SETTINGS):
+                out[MENU_SETTINGS] = menu
         if standin:
             for f in FRAME_RUNTIME_FILES:
                 nevr = f == "libovrplatformloader.so" and LIB + NEVR_PLATFORM_ORIG in names

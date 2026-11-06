@@ -58,10 +58,15 @@ Rift CV1 Touch controllers over Wi-Fi (the Rift Touch step; cv1bridge.exe is ins
      the Quest once: press X, Y, A and B together, then move both hands for 5 seconds.
 
 Game data: with "Install also copies Echo's game data" ticked (the default), Install
-also downloads Echo's game data (about 900 MB, once; from the same mirrors as the
-Echo VR installer app) and copies it to Android/media/com.readyatdawn.r15/files on
-the headset, where Echo reads it, plus the installer's asset patches. A headset that
-already has game data is left as it is. Your config.json (login) is never touched.
+also puts nevr-runtime's game data on the headset (1.6 GB download, only when a file
+is missing or different; each file is sha256-checked) and removes the EchoVR
+installer's asset patches, which were made for older data. Your config.json (login)
+is never touched.
+
+Graphics (Steam Frame, Pico): Echo's GRAPHICS settings page has a Foveated Rendering
+row: On (sharp centre, lower resolution towards the edges, faster) or Off (full
+resolution everywhere). It applies within about a second. On a Steam Frame Echo runs
+at 120 Hz.
 
 Logs: "Save logs" in the window (everything Echo logged, the crash log and the
 OpenXR runtime's lines; on Steam Frame, Echo must be running). adb (Google's

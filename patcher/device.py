@@ -8,8 +8,9 @@ the crash log, and the OpenXR runtime's lines.
 Game data comes from the same mirrors the Echo VR installer app uses
 (github.com/heisthecat31/EchoVR-Installer): _data.zip goes to Echo's own media folder,
 /sdcard/Android/media/com.readyatdawn.r15/files/, which is where Echo reads it on any
-Android (Quest, or Steam Frame's Lepton container). The asset patches from the installer's
-update manifest go next to it. config.json (the community-server login) is never touched.
+Android (Quest, or Steam Frame's Lepton container). For nevr-runtime's Echo, nevr's own game
+data instead (install_nevr_game_data), and the installer's asset patches, made for older data,
+are removed. config.json (the community-server login) is never touched.
 """
 import hashlib
 import io
@@ -856,8 +857,9 @@ def install_nevr_game_data(store, cache, log=print, say=None):
 
 def install_game_data(adb, serial, log=print, progress=None, nevr=False):
     """Downloads Echo's game data once (kept in <DATA>/cache until it's on a headset) and copies
-    over what the headset doesn't have yet, then the asset patches. progress(fraction, text).
-    nevr: Echo is nevr-runtime's build, so its own game data (install_nevr_game_data)."""
+    over what the headset doesn't have yet. progress(fraction, text). nevr: Echo is nevr-runtime's
+    build, so its own game data (install_nevr_game_data), and the installer's asset patches are
+    removed (remove_installer_asset_patches)."""
     say = progress or (lambda f, t: None)
     cache = os.path.join(DATA, "cache")
     os.makedirs(cache, exist_ok=True)
@@ -867,17 +869,14 @@ def install_game_data(adb, serial, log=print, progress=None, nevr=False):
         log(f"Steam Frame: Echo's storage is {store.base}")
     if nevr:
         install_nevr_game_data(store, cache, log, say)
-        say(0.96, "Checking the asset patches...")
-        install_asset_patches(store, cache, log, say)
+        remove_installer_asset_patches(store, log, say)
         store.done()
-        say(1.0, "Game data installed (nevr-runtime's); asset patches up to date.")
+        say(1.0, "Game data installed (nevr-runtime's).")
         return
     if store.has_game_data():
         # Never copy over an existing install: Echo updates its data itself (a headset can
         # hold newer manifests and extra packages than the zip), so the zip could downgrade it
-        say(0.96, "Game data is already on the headset. Checking the asset patches...")
-        install_asset_patches(store, cache, log, say)
-        say(1.0, "Game data is already on the headset; asset patches up to date.")
+        say(1.0, "Game data is already on the headset.")
         return
     store.check_writable()   # before 900 MB of downloading
 
@@ -924,48 +923,34 @@ def install_game_data(adb, serial, log=print, progress=None, nevr=False):
     if not store.has_game_data():
         raise IOError("the game data was copied, but the headset doesn't show all of it")
 
-    say(0.96, "Applying asset patches...")
-    install_asset_patches(store, cache, log, say)
     store.done()
     os.remove(zpath)   # on the headset now: give the PC its 900 MB back
     say(1.0, "Game data installed.")
 
 
-def install_asset_patches(store, cache, log=print, say=None):
-    """The Echo VR installer's mod patches: files listed in its update manifest, sha256-checked,
-    relative to Echo's storage folder. say(fraction, text) for each step."""
+def remove_installer_asset_patches(store, log=print, say=None):
+    """Removes the Echo VR installer's asset patches (files its update manifest lists) from Echo's
+    storage folder. nevr-runtime's game data is newer than the data they were made for, and
+    libassetpatch.so loaded them over it (seen on a Steam Frame: weapons' bullet effects missing).
+    Only a file whose sha256 is still the one the list gives is removed, so nothing else (nevr's
+    own, or a player's) is touched. A list that can't be read leaves everything as it is."""
     say = say or (lambda f, t: None)
-    say(0.96, "Asset patches: reading the list...")
-    with urllib.request.urlopen(urllib.request.Request(PATCH_MANIFEST_URL, headers=UA), timeout=30) as r:
-        text = r.read().decode("utf-8", "replace")
-    base = re.search(r"^#\s*Base URL:\s*(\S+)", text, re.M)
-    target = re.search(r"^#\s*Target:\s*(\S+)", text, re.M)
-    if not base or not target or target.group(1).rstrip("/") != MEDIA:
-        raise IOError("the asset patch list isn't in the expected format")
-    base = base.group(1).rstrip("/")
-    lines = [l.split() for l in text.splitlines() if len(l.split()) >= 2 and not l.startswith("#")]
-    for n, parts in enumerate(lines, 1):
-        op, path = parts[0].lower(), parts[1]
-        step = f"Asset patch {n} of {len(lines)}"
-        if not SAFE_PATH.match(path) or ".." in path:
-            raise IOError(f"unexpected path in the asset patch list: {path}")
-        if op == "del":
-            say(0.96, f"{step}: removing")
+    say(0.96, "Checking for the installer's asset patches...")
+    try:
+        with urllib.request.urlopen(urllib.request.Request(PATCH_MANIFEST_URL, headers=UA), timeout=30) as r:
+            text = r.read().decode("utf-8", "replace")
+    except Exception as e:
+        log(f"Asset patches: couldn't read the installer's list ({e}); none removed")
+        return
+    removed = 0
+    for parts in (l.split() for l in text.splitlines() if not l.startswith("#")):
+        if len(parts) < 3 or parts[0].lower() != "add":
+            continue
+        path, want = parts[1], parts[2].lower()
+        if not SAFE_PATH.match(path) or ".." in path or not path.startswith("asset_patches/"):
+            continue
+        if store.sha256(path) == want:
             store.remove(path)
-        elif op == "add" and len(parts) >= 3:
-            want = parts[2].lower()
-            say(0.96, f"{step}: checking")
-            if store.sha256(path) == want:
-                continue
-            local = os.path.join(cache, "patch-" + want)
-            fetch(f"{base}/{path}", local, lambda d, t: say(0.96, f"{step}: downloading {d / 1e6:.1f} of {t / 1e6:.1f} MB"))
-            with open(local, "rb") as f:
-                ok = hashlib.sha256(f.read()).hexdigest() == want
-            try:
-                if not ok:
-                    raise IOError(f"asset patch {path} didn't match its checksum")
-                say(0.97, f"{step}: copying to the headset")
-                store.put(local, path, lambda b: say(0.97, f"{step}: copying to the headset ({b / 1e6:.1f} MB)"))
-            finally:
-                os.remove(local)
-            log(f"  patched {path}")
+            removed += 1
+            log(f"  removed the installer's asset patch {path}")
+    log(f"Asset patches: {removed} of the installer's removed" if removed else "Asset patches: none of the installer's on the headset")
