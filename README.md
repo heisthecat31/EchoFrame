@@ -142,7 +142,11 @@ python tools/make_release.py        # build/release/EchoFrame-v<VERSION>.exe and
 ```
 
 A standalone `.exe` (PyInstaller): the patcher window with the runtime libraries and
-`cv1bridge.exe` inside (when it could be built), so users need nothing else. The zip adds README.txt and THIRD_PARTY_NOTICES.txt. Needs
+`cv1bridge.exe` inside (when it could be built), so users need nothing else. The zip adds README.txt and THIRD_PARTY_NOTICES.txt.
+**Automatic releases:** changing `VERSION` on `main` runs `.github/workflows/release.yml`, which
+builds both on GitHub's Windows runner and publishes them as the release `v<VERSION>` (Actions >
+Release > Run workflow rebuilds the current version). GitHub's runners have no Oculus PC SDK, so
+those builds have no `cv1bridge.exe` (Rift Touch). Needs
 everything the runtime build needs, plus `cryptography`, Pillow and PyInstaller. The version
 is in `VERSION`.
 

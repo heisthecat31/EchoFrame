@@ -1,0 +1,103 @@
+# Builds the Windows release (tools/make_release.py: EchoFrame-v<VERSION>.exe and .zip) and
+# publishes it as the GitHub release v<VERSION>.
+#
+# Runs when VERSION changes on main: bump VERSION, push, and the release appears. A version
+# that already has a release is skipped on push; "Run workflow" (Actions tab) rebuilds it and
+# replaces its files.
+#
+# cv1bridge.exe needs the Oculus PC SDK, which isn't on GitHub's runners, so releases built
+# here have no Rift Touch step unless cv1bridge.exe can be built (see cv1bridge/build.cmd).
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths: [VERSION]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  OPENXR_SDK_TAG: release-1.1.65
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version
+        id: version
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $v = (Get-Content VERSION -Raw).Trim()
+          if ($v -notmatch '^\d+\.\d+\.\d+$') { throw "VERSION is '$v', expected X.Y.Z" }
+          "version=$v" >> $env:GITHUB_OUTPUT
+          gh release view "v$v" --repo "${{ github.repository }}" *> $null
+          $exists = $LASTEXITCODE -eq 0
+          $global:LASTEXITCODE = 0
+          "exists=$($exists.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+          if ($exists -and "${{ github.event_name }}" -eq "push") {
+            "skip=true" >> $env:GITHUB_OUTPUT
+            Write-Host "Release v$v already exists: nothing to do (use Run workflow to rebuild it)."
+          } else {
+            "skip=false" >> $env:GITHUB_OUTPUT
+          }
+
+      - uses: actions/setup-python@v5
+        if: steps.version.outputs.skip != 'true'
+        with:
+          python-version: "3.12"
+
+      - name: Python packages
+        if: steps.version.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r patcher/requirements.txt pillow pyinstaller ninja
+
+      - name: Toolchain (Android NDK, Ninja, OpenXR SDK)
+        if: steps.version.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          if (-not $env:ANDROID_HOME -or -not (Test-Path "$env:ANDROID_HOME\ndk")) { throw "no Android NDK under ANDROID_HOME ($env:ANDROID_HOME)" }
+          Write-Host "NDKs: $((Get-ChildItem "$env:ANDROID_HOME\ndk" -Directory).Name -join ', ')"
+          $ninja = python -c "import ninja, os; print(os.path.join(ninja.BIN_DIR, 'ninja.exe'))"
+          "NINJA=$ninja" >> $env:GITHUB_ENV
+          $sdk = Join-Path $env:RUNNER_TEMP "OpenXR-SDK"
+          git clone --depth 1 --branch $env:OPENXR_SDK_TAG https://github.com/KhronosGroup/OpenXR-SDK $sdk
+          "OPENXR_SDK=$sdk" >> $env:GITHUB_ENV
+
+      - name: Build
+        if: steps.version.outputs.skip != 'true'
+        shell: pwsh
+        run: python tools/make_release.py
+
+      - uses: actions/upload-artifact@v4
+        if: steps.version.outputs.skip != 'true'
+        with:
+          name: EchoFrame-v${{ steps.version.outputs.version }}
+          path: build/release/EchoFrame-v*
+
+      - name: Publish release
+        if: steps.version.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $v = "${{ steps.version.outputs.version }}"
+          $files = Get-ChildItem build/release -File | Where-Object { $_.Name -like "EchoFrame-v$v.*" } | ForEach-Object { $_.FullName }
+          if ($files.Count -lt 2) { throw "expected the .exe and .zip in build/release" }
+          if ("${{ steps.version.outputs.exists }}" -eq "true") {
+            gh release upload "v$v" @files --clobber --repo "${{ github.repository }}"
+          } else {
+            gh release create "v$v" @files --repo "${{ github.repository }}" --target "${{ github.sha }}" `
+              --title "EchoFrame v$v" --generate-notes
+          }
