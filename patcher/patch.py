@@ -69,7 +69,10 @@ SIGNATURE_FILES = (".SF", ".RSA", ".DSA", ".EC")
 # Frame: ~/.local/share/Steam/steamapps/compatdata/<instance>/internal/<package>).
 MEDIA_DIR = "/sdcard/Android/media/com.readyatdawn.r15"
 FRAME_DATA_DIR = "/data/data/com.readyatdawn.r15"
-DATA_DIR_LIBS = ("libr15.so", "libassetpatch.so", "libovrplatformloader.so")   # the last: nevr-runtime's
+# libovrplatformloader.so: nevr-runtime's shim. libnevr-runtime.so: nevr-runtime 6.18+ moved its runtime
+# here, and its data-root hook (CSysInfo::GetDataRootDir) answers the engine with the media root, so
+# libr15.so's relocated path is never read unless this library is relocated too.
+DATA_DIR_LIBS = ("libr15.so", "libassetpatch.so", "libovrplatformloader.so", "libnevr-runtime.so")
 # Code changes in Echo's CGS::Initialize (libr15.so, build 4987566) for the Frame's Mesa
 # driver: (what, bytes to find (exactly once), offset in them, replacement).
 FRAME_CODE_PATCHES = [
